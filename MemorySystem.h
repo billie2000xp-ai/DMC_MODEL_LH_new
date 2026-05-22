@@ -223,9 +223,17 @@ private:
         PendingWriteMergeData(uint64_t task_, unsigned remaining_beats_);
     };
 
+    struct WriteMergeDataRemap {
+        uint64_t src_task;
+        uint64_t dst_task;
+        unsigned remaining_beats;
+        WriteMergeDataRemap(uint64_t src_task_, uint64_t dst_task_, unsigned remaining_beats_);
+    };
+
     vector<WriteMergeEntry> write_merge_buffer;
     vector<PendingWriteMergeResp> pending_write_merge_resps;
     vector<PendingWriteMergeData> pending_write_merge_datas;
+    vector<WriteMergeDataRemap> write_merge_data_remaps;
     uint64_t next_write_merge_task;
     uint64_t pre_write_merge_resp_time;
     unsigned totalWriteMergeInput;
@@ -246,6 +254,7 @@ private:
     bool dispatch_write_merge_entry(size_t index, bool force_mask_wcmd);
     bool pump_write_merge_buffer();
     bool flush_one_write_merge_entry();
+    bool remap_write_merge_data(uint32_t *data, uint64_t task);
     bool is_write_merge_data_task(uint64_t task) const;
     bool add_write_merge_data(uint32_t *data, uint64_t task);
     void update_write_merge_resp();
