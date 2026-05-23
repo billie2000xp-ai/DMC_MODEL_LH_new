@@ -208,6 +208,7 @@ private:
         unsigned second_data_ready_cnt;
         bool has_second;
         bool paired_tail;
+        uint64_t enqueue_time;
         uint8_t upstream_channel;
         WriteMergeEntry();
     };
@@ -215,7 +216,8 @@ private:
     struct PendingWriteMergeResp {
         uint64_t task;
         uint8_t channel;
-        PendingWriteMergeResp(uint64_t task_, uint8_t channel_);
+        uint64_t wait_data_task;
+        PendingWriteMergeResp(uint64_t task_, uint8_t channel_, uint64_t wait_data_task_ = 0xffffffffffffffffull);
     };
 
     struct PendingWriteMergeData {
@@ -246,7 +248,7 @@ private:
     unsigned preWriteMergePair;
     unsigned preWriteMergeUnpairedToRmw;
     unsigned preWriteMergeUnpairedDirect;
-    unsigned preWriteMergeBufferFull;    unsignedreWriteMergeBufferFull
+    unsigned preWriteMergeBufferFull;
 
     bool is_write_merge_candidate(const Transaction *trans) const;
     bool can_merge_write_pair(const Transaction *first, const Transaction *second) const;
