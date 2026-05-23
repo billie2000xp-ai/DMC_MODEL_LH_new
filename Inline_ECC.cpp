@@ -488,15 +488,8 @@ bool Inline_ECC::try_add_ecc_wr(Transaction * trans, uint32_t wr_ecc_buf_id) {
         wr_ecc_buf.at(wr_ecc_buf_id).slt_cnt++;
         wr_ecc_buf.at(wr_ecc_buf_id).buf_ctrl_state = WAIT_WRECC_BACK;
         top->parentMemorySystem->write_map[trans_wr_ecc->task] = msg_wr_ecc;
+        top->parentMemorySystem->addWriteDataPending(trans_wr_ecc->task, msg_wr_ecc.num_256bit, true);
         ecc_task++;
-        req_time=top->pre_req_data_time;
-        for(uint32_t i=0; i<msg_wr_ecc.num_256bit;i++){
-            if(DEBUG_BUS){
-                PRINTN(setw(10)<<now()<<" -- IECC WR AddData"<<endl);
-            }
-            top->pre_req_data_time =req_time;
-            top->parentMemorySystem->addData(nullptr, trans_wr_ecc->task, trans_wr_ecc->ecc_flag);
-        }
         ecc_conflict_cnt = IECC_CONFLICT_CNT;
         ecc_merge_flag = false;
         if (DEBUG_BUS) {
