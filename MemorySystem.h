@@ -208,6 +208,8 @@ private:
         unsigned second_data_ready_cnt;
         bool has_second;
         bool paired_tail;
+        bool task_allocated;
+        uint64_t merged_task;
         uint64_t enqueue_time;
         uint8_t upstream_channel;
         WriteMergeEntry();
