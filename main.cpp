@@ -97,6 +97,9 @@ bool some_object::write_response(unsigned channel, uint64_t task, double readDat
             assert(0);
         }
     }
+    if (task < 0xF000000000000000) {
+        OutstandingQueue.erase(task);
+    }
     return true;
 }
 
@@ -443,7 +446,6 @@ void send_command(LPMemorySystemTop *ddrc) {
                             write_task.push_back(w_data);
                             data_cnt ++;
                         }
-                        OutstandingQueue.erase(transaction.task);
                     }
                     CommandQueue[i].erase(CommandQueue[i].begin());
                 }
@@ -572,6 +574,8 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    const uint64_t match_task_limit = 10000;
+
     while (1) {
         if (STOP_WITH_STATETIME && cnt >= STOP_WINDOW * STATE_TIME) {
             if (STATE_TIME == 0) {
@@ -612,12 +616,21 @@ int main(int argc, char *argv[]) {
         } else {
             if (LATENCY_MODE) rand_command(mem, true);
             if (PRINT_IDLE_LAT && cnt >= 1000) exit(0);
-            if (!PRINT_IDLE_LAT || (cnt % 1000 == 0)) rand_command(mem, false);
+            if (!MATCH_MODE || task_cnt < match_task_limit) {
+                if (!PRINT_IDLE_LAT || (cnt % 1000 == 0)) rand_command(mem, false);
+            }
         }
         send_command(mem);
         send_wdata(mem);
         if (MATCH_MODE) {
-            if (task_cnt == 20000) {
+            bool command_queue_empty = true;
+            for (auto &queue : CommandQueue) {
+                if (!queue.empty()) {
+                    command_queue_empty = false;
+                    break;
+                }
+            }
+            if (task_cnt >= match_task_limit && OutstandingQueue.empty() && command_queue_empty && write_task.empty()) {
             //if (task_cnt == 100000) {
                 float efficiency = 0;
                 efficiency = calc_effi();
