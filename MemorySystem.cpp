@@ -19,8 +19,8 @@ MemorySystem::WriteMergeEntry::WriteMergeEntry()
 MemorySystem::PendingWriteMergeResp::PendingWriteMergeResp(uint64_t task_, uint8_t channel_, uint64_t wait_data_task_)
         : task(task_), channel(channel_), wait_data_task(wait_data_task_) {}
 
-MemorySystem::PendingWriteMergeData::PendingWriteMergeData(uint64_t task_, unsigned remaining_beats_)
-        : task(task_), remaining_beats(remaining_beats_) {}
+MemorySystem::PendingWriteMergeData::PendingWriteMergeData(uint64_t task_, unsigned remaining_beats_, bool ecc_flag_)
+        : task(task_), remaining_beats(remaining_beats_), ecc_flag(ecc_flag_) {}
 
 MemorySystem::WriteMergeDataRemap::WriteMergeDataRemap(uint64_t src_task_, uint64_t dst_task_, unsigned remaining_beats_)
         : src_task(src_task_), dst_task(dst_task_), remaining_beats(remaining_beats_) {}
@@ -677,12 +677,10 @@ bool MemorySystem::add_write_merge_data(uint32_t *data, uint64_t task) {
         if (entry.paired_tail) continue;
         if (entry.first_trans != NULL && entry.first_trans->task == task) {
             if (entry.first_data_ready_cnt <= entry.first_trans->burst_length) entry.first_data_ready_cnt++;
-            pump_write_merge_buffer();
             return true;
         }
         if (entry.has_second && entry.second_trans != NULL && entry.second_trans->task == task) {
             if (entry.second_data_ready_cnt <= entry.second_trans->burst_length) entry.second_data_ready_cnt++;
-            pump_write_merge_buffer();
             return true;
         }
     }
@@ -709,21 +707,33 @@ void MemorySystem::update_write_merge_resp() {
     }
 }
 
-void MemorySystem::update_write_merge_data() {
-    if (pending_write_merge_datas.empty()) return;
-    if (addData(NULL, pending_write_merge_datas[0].task, false)) {
+bool MemorySystem::update_write_merge_data() {
+    if (pending_write_merge_datas.empty()) return false;
+    if (addData(NULL, pending_write_merge_datas[0].task, pending_write_merge_datas[0].ecc_flag)) {
         pending_write_merge_datas[0].remaining_beats--;
         if (pending_write_merge_datas[0].remaining_beats == 0) {
             pending_write_merge_datas.erase(pending_write_merge_datas.begin());
         }
+        return true;
     }
+    return false;
+}
+
+bool MemorySystem::addWriteDataPending(uint64_t task, unsigned remaining_beats, bool ecc_flag) {
+    if (remaining_beats == 0) return true;
+    pending_write_merge_datas.push_back(PendingWriteMergeData(task, remaining_beats, ecc_flag));
+    return true;
 }
 
 bool MemorySystem::addTransaction(Transaction *trans) {
     if (is_write_merge_candidate(trans)) {
         return handle_write_merge_transaction(trans);
     }
-    pump_write_merge_buffer();
+    if (!write_merge_buffer.empty() && trans != NULL && trans->transactionType == DATA_READ) {
+        if (!pump_write_merge_buffer()) return false;
+    } else {
+        pump_write_merge_buffer();
+    }
     return submitTransaction(trans);
 }
 //==============================================================================
@@ -847,7 +857,6 @@ bool MemorySystem::addData(uint32_t *data ,uint64_t taskId, bool ecc_flag) {
 //==============================================================================
 void MemorySystem::update() {
     update_write_merge_resp();
-    update_write_merge_data();
     pump_write_merge_buffer();
     //updates the state of each of the objects
     // NOTE - do not change order
@@ -905,6 +914,8 @@ void MemorySystem::update() {
         memoryController->rmw->step();
     }
     memoryController->step();
+
+    update_write_merge_data();
 
     for (size_t i=0;i<NUM_RANKS;i++) {
         (*ranks).at(i)->step();
