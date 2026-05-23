@@ -32,6 +32,7 @@ public:
     bool addTransaction(bool isWrite, uint64_t addr);
     void noc_read_inform(bool fast_wakeup_rank0, bool fast_wakeup_rank1, bool bus_rempty);
     bool addData(uint32_t *data ,uint64_t id, bool ecc_flag);
+    bool addWriteDataPending(uint64_t task, unsigned remaining_beats, bool ecc_flag = false);
     bool WillAcceptTransaction();
     void RegisterCallbacks(Callback_t *readData, Callback_t *writeDone, Callback_t *readDone, Callback_t *cmdDone);
     void check_bank(uint32_t *dmc_2up_bank, uint32_t rank, uint32_t type);
@@ -225,7 +226,8 @@ private:
     struct PendingWriteMergeData {
         uint64_t task;
         unsigned remaining_beats;
-        PendingWriteMergeData(uint64_t task_, unsigned remaining_beats_);
+        bool ecc_flag;
+        PendingWriteMergeData(uint64_t task_, unsigned remaining_beats_, bool ecc_flag_ = false);
     };
 
     struct WriteMergeDataRemap {
@@ -263,7 +265,7 @@ private:
     bool is_write_merge_data_task(uint64_t task) const;
     bool add_write_merge_data(uint32_t *data, uint64_t task);
     void update_write_merge_resp();
-    void update_write_merge_data();
+    bool update_write_merge_data();
     bool write_merge_response(uint64_t task, uint8_t channel);
 };
 }
