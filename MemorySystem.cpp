@@ -13,10 +13,10 @@ ofstream cmd_verify_out; //used in Rank.cpp and MemoryController.cpp if VERIFICA
 
 MemorySystem::WriteMergeEntry::WriteMergeEntry()
         : first_trans(NULL), second_trans(NULL), first_data_ready_cnt(0),
-          second_data_ready_cnt(0), has_second(false), paired_tail(false), upstream_channel(0) {}
+          second_data_ready_cnt(0), has_second(false), paired_tail(false), enqueue_time(0), upstream_channel(0) {}
 
-MemorySystem::PendingWriteMergeResp::PendingWriteMergeResp(uint64_t task_, uint8_t channel_)
-        : task(task_), channel(channel_) {}
+MemorySystem::PendingWriteMergeResp::PendingWriteMergeResp(uint64_t task_, uint8_t channel_, uint64_t wait_data_task_)
+        : task(task_), channel(channel_), wait_data_task(wait_data_task_) {}
 
 MemorySystem::PendingWriteMergeData::PendingWriteMergeData(uint64_t task_, unsigned remaining_beats_)
         : task(task_), remaining_beats(remaining_beats_) {}
@@ -463,9 +463,6 @@ bool MemorySystem::can_merge_write_pair(const Transaction *first, const Transact
     if (first == NULL || second == NULL) return false;
     if (!is_write_merge_candidate(first) || !is_write_merge_candidate(second)) return false;
     if (first->channel != second->channel) return false;
-    if (first->rank != second->rank) return false;
-    if (first->bankIndex != second->bankIndex) return false;
-    if (first->row != second->row) return false;
     uint64_t first_addr = first->address;
     uint64_t second_addr = second->address;
     uint64_t low_addr = first_addr < second_addr ? first_addr : second_addr;
@@ -527,7 +524,7 @@ bool MemorySystem::dispatch_write_merge_entry(size_t index, bool force_mask_wcmd
         if (entry.first_data_ready_cnt < first_beats) {
             write_merge_data_remaps.push_back(WriteMergeDataRemap(entry.first_trans->task, dispatch_task, first_beats - entry.first_data_ready_cnt));
         }
-        pending_write_merge_resps.push_back(PendingWriteMergeResp(entry.first_trans->task, entry.upstream_channel));
+        pending_write_merge_resps.push_back(PendingWriteMergeResp(entry.first_trans->task, entry.upstream_channel, entry.first_trans->task));
         totalWriteMergePair++;
         if (DEBUG_BUS) {
             PRINTN(setw(10)<<now()<<" -- WCMERGE_PAIR_DISPATCH :: first_task="<<entry.first_trans->task
@@ -575,6 +572,10 @@ bool MemorySystem::pump_write_merge_buffer() {
     if (!write_merge_buffer.empty() && write_merge_buffer[0].has_second) {
         return dispatch_write_merge_entry(0, false);
     }
+    if (!write_merge_buffer.empty() && WRITE_MERGE_BUFFER_DEPTH != 0 &&
+            now() >= write_merge_buffer[0].enqueue_time + WRITE_MERGE_BUFFER_DEPTH) {
+        return dispatch_write_merge_entry(0, UNPAIRED_TO_RMW_EN);
+    }
     return false;
 }
 
@@ -598,7 +599,7 @@ bool MemorySystem::handle_write_merge_transaction(Transaction *trans) {
             paired_tail.upstream_channel = channel;
             write_merge_buffer.insert(write_merge_buffer.begin() + i + 1, paired_tail);
             if (write_merge_buffer.size() > WRITE_MERGE_BUFFER_DEPTH) {
-                flush_one_write_merge_entry();
+                if (!flush_one_write_merge_entry()) return false;
             }
             if (DEBUG_BUS) {
                 PRINTN(setw(10)<<now()<<" -- WCMERGE_PAIR_HIT :: first_task="<<write_merge_buffer[i].first_trans->task
@@ -614,12 +615,13 @@ bool MemorySystem::handle_write_merge_transaction(Transaction *trans) {
         totalWriteMergeBufferFull++;
         if (DEBUG_BUS) {
             PRINTN(setw(10)<<now()<<" -- WCMERGE_BUF_FULL :: incoming_task="<<trans->task
-                    <<" flush_task="<<write_merge_buffer[0].first_trans->task<<" used="<<write_merge_buffer.size()<<endl);
+                            <<" flush_task="<<(write_merge_buffer[0].paired_tail ? 0 : write_merge_buffer[0].first_trans->task)<<" used="<<write_merge_buffer.size()<<endl);
         }
         if (!flush_one_write_merge_entry()) return false;
     }
     WriteMergeEntry entry;
     entry.first_trans = trans;
+    entry.enqueue_time = now();
     entry.upstream_channel = channel;
     write_merge_buffer.push_back(entry);
     if (DEBUG_BUS) {
@@ -684,6 +686,12 @@ bool MemorySystem::write_merge_response(uint64_t task, uint8_t resp_channel) {
 void MemorySystem::update_write_merge_resp() {
     if (pending_write_merge_resps.empty()) return;
     if (pre_write_merge_resp_time == now()) return;
+    uint64_t wait_task = pending_write_merge_resps[0].wait_data_task;
+    if (wait_task != 0xffffffffffffffffull) {
+        for (size_t i = 0; i < write_merge_data_remaps.size(); i++) {
+            if (write_merge_data_remaps[i].src_task == wait_task) return;
+        }
+    }
     if (write_merge_response(pending_write_merge_resps[0].task, pending_write_merge_resps[0].channel)) {
         pre_write_merge_resp_time = now();
         pending_write_merge_resps.erase(pending_write_merge_resps.begin());
