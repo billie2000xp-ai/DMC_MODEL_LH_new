@@ -465,11 +465,12 @@ bool Inline_ECC::try_add_ecc_wr(Transaction * trans, uint32_t wr_ecc_buf_id) {
     top->parentMemorySystem->trans_init(trans_wr_ecc, now());
     trans_wr_ecc->qos = IECC_PRI;
     trans_wr_ecc->pri = IECC_PRI;
-//    addressMapping(*trans_wr_ecc);
-    get_pdu_addr(&wr_ecc_buf[wr_ecc_buf_id], trans_wr_ecc);
-//    if (RMW_ENABLE) {
-    addr_ecc_map(trans_wr_ecc);
-//    }
+    if (PDU_PUSH_MODE && trans->transactionType == DATA_WRITE && !trans->mask_wcmd) {
+        addr_ecc_map(trans_wr_ecc);
+    } else {
+        get_pdu_addr(&wr_ecc_buf[wr_ecc_buf_id], trans_wr_ecc);
+        addr_ecc_map(trans_wr_ecc);
+    }
     msg_wr_ecc.pt = DMC_PATH;
     msg_wr_ecc.num_256bit = trans_wr_ecc->burst_length + 1;
     if(wr_ecc_buf[wr_ecc_buf_id].wr_ecc_pos!=0xffff){
@@ -647,7 +648,8 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
                 }
             }
             else{
-                if (wr_ecc_buf.at(avail_wr_ecc_buf_id).wr_ecc) {
+                bool pdu_push_wr = PDU_PUSH_MODE && !trans->mask_wcmd;
+                if (wr_ecc_buf.at(avail_wr_ecc_buf_id).wr_ecc && !pdu_push_wr) {
                         ecc_model_state = ADD_WR_ECC_TRANS;
                         wr_ecc_buf.at(avail_wr_ecc_buf_id).wr_ecc = false;
                         if (DEBUG_BUS) {
@@ -693,27 +695,25 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
                     return (ecc_model_state == TRY_HIT_ECC_BUF);
                 }
             } else if (trans_cmd->transactionType == DATA_WRITE) {
+                bool pdu_push_wr = PDU_PUSH_MODE && !trans->mask_wcmd;
+                if (pdu_push_wr && !top->WillAcceptTransactions(2)) return false;
                 if (ecc_try_add_wr_trans(trans_cmd, avail_wr_ecc_buf_id)) {
-                    ecc_model_state = TRY_HIT_ECC_BUF;
-                    wr_ecc_buf.at(avail_wr_ecc_buf_id).pdu_addr = pdu_addr;//update 24/10/21
-                    /*
-                    if (wr_ecc_buf.at(avail_wr_ecc_buf_id).wr_ecc) {
-                        ecc_model_state = ADD_WR_ECC_TRANS;
-                        wr_ecc_buf.at(avail_wr_ecc_buf_id).wr_ecc = false;
-                    }
-                    */                  
-                    if (ecc_model_state == TRY_HIT_ECC_BUF) {
-                        if (DEBUG_BUS) {
-                            PRINTN(setw(10)<<now()<<" -- ECC_ADD_TRANS :: address=0x"<<hex<<trans->address
-                                    <<", task="<<dec<<trans->task<<", nxt_state=TRY_HIT_ECC_BUF"<<endl);
+                    if (pdu_push_wr) {
+                        if (try_add_ecc_wr(trans, avail_wr_ecc_buf_id)) {
+                            ecc_model_state = TRY_HIT_ECC_BUF;
+                            ecc_pre_state = ADD_WR_ECC_TRANS;
+                        } else {
+                            ecc_model_state = ADD_WR_ECC_TRANS;
                         }
                     } else {
-                        if (DEBUG_BUS) {
-                            PRINTN(setw(10)<<now()<<" -- ECC_ADD_TRANS :: address=0x"<<hex<<trans->address
-                                    <<", task="<<dec<<trans->task<<", nxt_state=ADD_WR_ECC_TRANS"<<endl);
-                        }
+                        ecc_model_state = TRY_HIT_ECC_BUF;
                     }
-                    return (ecc_model_state == TRY_HIT_ECC_BUF);
+                    wr_ecc_buf.at(avail_wr_ecc_buf_id).pdu_addr = pdu_addr;
+                    if (DEBUG_BUS) {
+                        PRINTN(setw(10)<<now()<<" -- ECC_ADD_TRANS :: address=0x"<<hex<<trans->address
+                                <<", task="<<dec<<trans->task<<", nxt_state=TRY_HIT_ECC_BUF"<<endl);
+                    }
+                    return true;
                 }
             }
             break;
@@ -737,7 +737,11 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
         }
         case ADD_WR_ECC_TRANS: {
             if (try_add_ecc_wr(trans, avail_wr_ecc_buf_id)) {
-                ecc_model_state = WAIT_ECC_DATA_FINISH;
+                if (PDU_PUSH_MODE && trans->transactionType == DATA_WRITE && !trans->mask_wcmd) {
+                    ecc_model_state = TRY_HIT_ECC_BUF;
+                } else {
+                    ecc_model_state = WAIT_ECC_DATA_FINISH;
+                }
                 ecc_pre_state = ADD_WR_ECC_TRANS;
                 if (DEBUG_BUS) {
                     PRINTN(setw(10)<<now()<<" -- ADD_WR_ECC_TRANS :: address=0x"<<hex<<trans->address
