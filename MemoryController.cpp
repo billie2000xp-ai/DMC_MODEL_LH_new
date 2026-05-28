@@ -1329,15 +1329,18 @@ void MemoryController::fresh_timing(const BusPacket &bus_packet,bool hit) {
 //    DEBUG(now()<<" sc="<<sub_channel<<" sc_bank_num="<<sc_bank_num<<" NUM_BANKS="<<NUM_BANKS<<" sc_num="<<sc_num);
     unsigned bank_start = sub_channel * NUM_BANKS / sc_num;
 //    unsigned bank_pair_start = sub_channel * pbr_bank_num;
+    BusPacket timing_packet = bus_packet;
+    if (timing_packet.type == WRITE_MASK_CMD) timing_packet.type = WRITE_CMD;
+    else if (timing_packet.type == WRITE_MASK_P_CMD) timing_packet.type = WRITE_P_CMD;
     unsigned rw_intlv_cnt = 0;
-    if (bus_packet.type >= WRITE_CMD && bus_packet.type <= READ_P_CMD) {
+    if (timing_packet.type >= WRITE_CMD && timing_packet.type <= READ_P_CMD) {
         bankStates[bus_packet.bankIndex].state->rwIntlvCountdown = BL_n_min[bus_packet.bl];
     }
     for (auto &state : bankStates) {
         if (state.state->rwIntlvCountdown > 0) rw_intlv_cnt ++;
     }
     unsigned trp_pb = bus_packet.fg_ref ? tRPfg : tRPpb;
-    switch (bus_packet.type) {
+    switch (timing_packet.type) {
         case READ_CMD :
         case READ_P_CMD :{     //todo: revise for e-mode
             for (auto &state : bankStates) {
@@ -7338,6 +7341,21 @@ void MemoryController::que_pipeline() {
             if (bankStates[trans->bankIndex].state->currentBankState != RowActive) continue;
             if (trans->row == bankStates[trans->bankIndex].state->openRowAddress) continue;
             if (tout_high_pri <= trans->pri) {
+                bool same_bank_timeout_rowhit = false;
+                for (auto &t : transactionQueue) {
+                    if (t->addrconf) continue;
+                    if (t->pre_act) continue;
+                    if (now() < t->arb_time) continue;
+                    if (t->bp_by_tout) continue;
+                    if (!t->timeout) continue;
+                    if (t->bankIndex != trans->bankIndex) continue;
+                    if (t->row != bankStates[t->bankIndex].state->openRowAddress) continue;
+                    if (t->pri <= trans->pri) {
+                        same_bank_timeout_rowhit = true;
+                        break;
+                    }
+                }
+                if (same_bank_timeout_rowhit) continue;
                 bankStates[trans->bankIndex].hold_precharge = false;
                 if (DEBUG_BUS) {
                     PRINTN(setw(10)<<now()<<" -- HPRE :: Timeout set hold_precharge false, task="
@@ -8707,6 +8725,15 @@ void MemoryController::lc(Transaction *t) {
 
 bool MemoryController::WillAcceptTransaction() {
     return GetDmcQsize() < TRANS_QUEUE_DEPTH;
+}
+
+bool MemoryController::WillAcceptTransactions(unsigned num) {
+    return GetDmcQsize() + num <= TRANS_QUEUE_DEPTH;
+}
+
+bool MemoryController::HasPendingWork() const {
+    return !transactionQueue.empty() || !WriteResp.empty() || !ReadResp.empty() || !CmdResp.empty()
+            || dresp_cnt != 0 || (que_read_cnt + que_write_cnt) != 0;
 }
 
 /***************************************************************************************************
