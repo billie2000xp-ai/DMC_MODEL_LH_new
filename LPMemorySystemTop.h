@@ -8,6 +8,7 @@
 #include "Rmw.h"
 #include "IniReader.h"
 #include "assert.h"
+#include <deque>
 
 namespace LPDDRSim {
 struct cmd_message {
@@ -59,6 +60,8 @@ public:
 
     uint32_t getTransQueSize(uint32_t dmc_id, bool isRd);
     uint32_t getRmwQueueCmdNum(uint8_t ch) const;
+    bool hasPendingWork() const;
+    void flushWriteMergeBuffers();
 
     //output file
     ofstream DDRSim_log;
@@ -89,10 +92,32 @@ private:
 
     TransactionCompleteCB *read_cb;
     TransactionCompleteCB *write_cb;
+    TransactionCompleteCB *read_done_cb;
+    TransactionCompleteCB *cmd_done_cb;
+    struct TopRespPacket {
+        unsigned channel;
+        uint64_t task;
+        double readDataEnterDmcTime;
+        double reqAddToDmcTime;
+        double reqEnterDmcBufTime;
+    };
+    std::deque<TopRespPacket> top_rdata_fifo;
+    std::deque<TopRespPacket> top_wresp_fifo;
+    std::deque<TopRespPacket> top_rresp_fifo;
+    std::deque<TopRespPacket> top_cmdresp_fifo;
+    const size_t TOP_RESP_FIFO_DEPTH = 16;
 
     void command_check(const hha_command &c);
     void wdata_check(uint64_t task, uint8_t channel);
     uint8_t addr_map_ch(const hha_command &c);
+    bool handle_read_data(unsigned channel, uint64_t task,
+            double readDataEnterDmcTime, double reqAddToDmcTime, double reqEnterDmcBufTime);
+    bool handle_write_done(unsigned channel, uint64_t task,
+            double readDataEnterDmcTime, double reqAddToDmcTime, double reqEnterDmcBufTime);
+    bool handle_read_done(unsigned channel, uint64_t task,
+            double readDataEnterDmcTime, double reqAddToDmcTime, double reqEnterDmcBufTime);
+    bool handle_cmd_done(unsigned channel, uint64_t task,
+            double readDataEnterDmcTime, double reqAddToDmcTime, double reqEnterDmcBufTime);
 
 #ifdef DDRC_NEED_DEBUG
     uint32_t test_mode;
