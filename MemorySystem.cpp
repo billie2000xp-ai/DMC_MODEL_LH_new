@@ -505,13 +505,17 @@ bool MemorySystem::dispatch_write_merge_entry(size_t index, bool force_mask_wcmd
     if (!entry.has_second && !mask_wcmd) {
         dispatch_trans = entry.first_trans;
     } else {
-        if (!entry.task_allocated) {
+        if (entry.has_second) {
+            dispatch_task = entry.second_trans->task;
+        } else if (!entry.task_allocated) {
             entry.merged_task = next_write_merge_task++;
             entry.task_allocated = true;
             write_merge_buffer[index].merged_task = entry.merged_task;
             write_merge_buffer[index].task_allocated = true;
+            dispatch_task = entry.merged_task;
+        } else {
+            dispatch_task = entry.merged_task;
         }
-        dispatch_task = entry.merged_task;
         dispatch_trans = build_merged_write_transaction(entry, dispatch_task, mask_wcmd);
     }
 
@@ -528,14 +532,17 @@ bool MemorySystem::dispatch_write_merge_entry(size_t index, bool force_mask_wcmd
     if (entry.has_second) {
         if (entry.first_data_ready_cnt > 0) pending_write_merge_datas.push_back(PendingWriteMergeData(dispatch_task, entry.first_data_ready_cnt));
         if (entry.second_data_ready_cnt > 0) pending_write_merge_datas.push_back(PendingWriteMergeData(dispatch_task, entry.second_data_ready_cnt));
-        if (entry.first_data_ready_cnt < first_beats) {
+        if (entry.first_trans->task != dispatch_task && entry.first_data_ready_cnt < first_beats) {
             write_merge_data_remaps.push_back(WriteMergeDataRemap(entry.first_trans->task, dispatch_task, first_beats - entry.first_data_ready_cnt));
         }
-        if (entry.second_data_ready_cnt < second_beats) {
+        if (entry.second_trans->task != dispatch_task && entry.second_data_ready_cnt < second_beats) {
             write_merge_data_remaps.push_back(WriteMergeDataRemap(entry.second_trans->task, dispatch_task, second_beats - entry.second_data_ready_cnt));
         }
-        pending_write_merge_resps.push_back(PendingWriteMergeResp(entry.first_trans->task, entry.upstream_channel, entry.first_trans->task));
-        pending_write_merge_resps.push_back(PendingWriteMergeResp(entry.second_trans->task, entry.upstream_channel, entry.second_trans->task));
+        if (entry.first_data_ready_cnt < first_beats) {
+            pending_write_merge_resps.push_back(PendingWriteMergeResp(entry.first_trans->task, entry.upstream_channel, entry.first_trans->task));
+        } else if (!write_merge_response(entry.first_trans->task, entry.upstream_channel)) {
+            pending_write_merge_resps.push_back(PendingWriteMergeResp(entry.first_trans->task, entry.upstream_channel));
+        }
         totalWriteMergePair++;
         if (DEBUG_BUS) {
             PRINTN(setw(10)<<now()<<" -- WCMERGE_PAIR_DISPATCH :: first_task="<<entry.first_trans->task
@@ -570,9 +577,6 @@ bool MemorySystem::dispatch_write_merge_entry(size_t index, bool force_mask_wcmd
         delete entry.second_trans;
     }
     write_merge_buffer.erase(write_merge_buffer.begin() + index);
-    if (index < write_merge_buffer.size() && write_merge_buffer[index].paired_tail) {
-        write_merge_buffer.erase(write_merge_buffer.begin() + index);
-    }
     return true;
 }
 
@@ -598,25 +602,34 @@ bool MemorySystem::flush_one_write_merge_entry() {
     return dispatch_write_merge_entry(0, UNPAIRED_TO_RMW_EN);
 }
 
+void MemorySystem::flush_all_write_merge_entries() {
+    while (!write_merge_buffer.empty()) {
+        if (!flush_one_write_merge_entry()) break;
+    }
+}
+
+void MemorySystem::flushWriteMergeBuffer() {
+    flush_all_write_merge_entries();
+}
+
+bool MemorySystem::hasPendingWork() const {
+    return !PreDmcPipeQueue.empty() || !write_merge_buffer.empty() || !pending_write_merge_resps.empty()
+            || !pending_write_merge_datas.empty() || !write_merge_data_remaps.empty()
+            || memoryController->HasPendingWork();
+}
+
 bool MemorySystem::handle_write_merge_transaction(Transaction *trans) {
-    totalWriteMergeInput++;
     pump_write_merge_buffer();
-    for (size_t i = 0; i < write_merge_buffer.size(); i++) {
-        if (!write_merge_buffer[i].has_second && !write_merge_buffer[i].paired_tail && can_merge_write_pair(write_merge_buffer[i].first_trans, trans)) {
-            write_merge_buffer[i].second_trans = trans;
-            write_merge_buffer[i].has_second = true;
-            WriteMergeEntry paired_tail;
-            paired_tail.paired_tail = true;
-            paired_tail.upstream_channel = channel;
-            write_merge_buffer.insert(write_merge_buffer.begin() + i + 1, paired_tail);
-            if (write_merge_buffer.size() > WRITE_MERGE_BUFFER_DEPTH) {
-                flush_one_write_merge_entry();
-            }
+    if (!write_merge_buffer.empty()) {
+        WriteMergeEntry &tail = write_merge_buffer.back();
+        if (!tail.has_second && !tail.paired_tail && can_merge_write_pair(tail.first_trans, trans)) {
+            tail.second_trans = trans;
+            tail.has_second = true;
+            totalWriteMergeInput++;
             if (DEBUG_BUS) {
-                PRINTN(setw(10)<<now()<<" -- WCMERGE_PAIR_HIT :: first_task="<<write_merge_buffer[i].first_trans->task
-                        <<" second_task="<<trans->task<<" first_addr=0x"<<hex<<write_merge_buffer[i].first_trans->address
-                        <<" second_addr=0x"<<trans->address<<dec<<" insert_pos="<<(i + 1)
-                        <<" used="<<write_merge_buffer.size()<<endl);
+                PRINTN(setw(10)<<now()<<" -- WCMERGE_PAIR_HIT :: first_task="<<tail.first_trans->task
+                        <<" second_task="<<trans->task<<" first_addr=0x"<<hex<<tail.first_trans->address
+                        <<" second_addr=0x"<<trans->address<<dec<<" used="<<write_merge_buffer.size()<<endl);
             }
             pump_write_merge_buffer();
             return true;
@@ -635,6 +648,7 @@ bool MemorySystem::handle_write_merge_transaction(Transaction *trans) {
     entry.enqueue_time = now();
     entry.upstream_channel = channel;
     write_merge_buffer.push_back(entry);
+    totalWriteMergeInput++;
     if (DEBUG_BUS) {
         PRINTN(setw(10)<<now()<<" -- WCMERGE_BUF_ADD :: task="<<trans->task<<" addr=0x"<<hex<<trans->address<<dec
                 <<" used="<<write_merge_buffer.size()<<" depth="<<WRITE_MERGE_BUFFER_DEPTH<<endl);
@@ -729,10 +743,9 @@ bool MemorySystem::addTransaction(Transaction *trans) {
     if (is_write_merge_candidate(trans)) {
         return handle_write_merge_transaction(trans);
     }
-    if (!write_merge_buffer.empty() && trans != NULL && trans->transactionType == DATA_READ) {
-        if (!pump_write_merge_buffer()) return false;
-    } else {
+    if (!write_merge_buffer.empty()) {
         pump_write_merge_buffer();
+        return false;
     }
     return submitTransaction(trans);
 }
@@ -1618,8 +1631,11 @@ void MemorySystem::statistics() {
     }
 
     STATE_PRINTN("-------------------- Request Statistics (DDR Command Number) --------------------------\n");
-    row_hit_cnt = ((read_cnt + read_p_cnt + write_cnt + write_p_cnt + mwrite_cnt + mwrite_p_cnt) > act_cnt) ?
-            (read_cnt + read_p_cnt + write_cnt + write_p_cnt + mwrite_cnt + mwrite_p_cnt - act_cnt) : 0;
+    uint64_t cas64_cnt = memoryController->TotalDmcRd32B + memoryController->TotalDmcWr32B +
+            memoryController->TotalDmcRd64B + memoryController->TotalDmcWr64B +
+            (memoryController->TotalDmcRd128B + memoryController->TotalDmcWr128B) * 2 +
+            (memoryController->TotalDmcRd256B + memoryController->TotalDmcWr256B) * 4;
+    row_hit_cnt = (cas64_cnt > act_cnt) ? (cas64_cnt - act_cnt) : 0;
     row_miss_cnt = act_cnt;
 
     STATE_PRINTN(setw(36)<<"Active cnt"<<" : "<<setw(12)<<act_cnt - pre_act_cnt);
