@@ -40,6 +40,8 @@ public:
     uint8_t get_occ();
     uint32_t GetTransactionLen();
     uint32_t getTransQueSize(bool isRd);
+    bool hasPendingWork() const;
+    void flushWriteMergeBuffer();
     void dfs_backpress(bool backpress);
 //    void dfs_backpress(bool backpress) {memoryController->dfs_backpress(backpress);};
     //fields
@@ -261,6 +263,7 @@ private:
     bool dispatch_write_merge_entry(size_t index, bool force_mask_wcmd);
     bool pump_write_merge_buffer();
     bool flush_one_write_merge_entry();
+    void flush_all_write_merge_entries();
     bool remap_write_merge_data(uint32_t *data, uint64_t task);
     bool is_write_merge_data_task(uint64_t task) const;
     bool add_write_merge_data(uint32_t *data, uint64_t task);
