@@ -21,6 +21,10 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
 LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string LogPath,
         int argc, char *argv[]) : hhaId(hhaId) {
 #endif
+    read_cb = NULL;
+    write_cb = NULL;
+    read_done_cb = NULL;
+    cmd_done_cb = NULL;
 
 #ifdef SYSARCH_PLATFORM
     IniFilename = "parameter/public.ini";
@@ -146,6 +150,7 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
     BUSYSTATE_INC_WCMD = cfg->getBool("BUSYSTATE_INC_WCMD");
     BUSYSTATE_TH = cfg->getNumber("BUSYSTATE_TH");
     IECC_ENABLE = cfg->getBool("IECC_ENABLE");
+    PDU_PUSH_MODE = cfg->getBool("PDU_PUSH_MODE");
     PDU_DEPTH = cfg->getNumber("PDU_DEPTH");
     IECC_CONFLICT_CNT = cfg->getNumber("IECC_CONFLICT_CNT");
     IECC_PARTIAL_BYPASS = cfg->getBool("IECC_PARTIAL_BYPASS");
@@ -431,6 +436,7 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
     GET_PARAM(BUSYSTATE_INC_WCMD, "BUSYSTATE_INC_WCMD", getBool);
     GET_PARAM(BUSYSTATE_TH, "BUSYSTATE_TH", getUint);
     GET_PARAM(IECC_ENABLE, "IECC_ENABLE", getBool);
+    GET_PARAM(PDU_PUSH_MODE, "PDU_PUSH_MODE", getBool);
     GET_PARAM(PDU_DEPTH, "PDU_DEPTH", getUint);
     GET_PARAM(IECC_CONFLICT_CNT, "IECC_CONFLICT_CNT", getUint);
     GET_PARAM(IECC_PARTIAL_BYPASS, "IECC_PARTIAL_BYPASS", getBool);
@@ -843,6 +849,14 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
         channels.push_back(channel);
     }
 
+    for (size_t i = 0; i < NUM_CHANS; i++) {
+        channels[i]->RegisterCallbacks(
+                new LPDDRSim::Callback<LPMemorySystemTop, bool, unsigned, uint64_t, double, double, double>(this, &LPMemorySystemTop::handle_read_data),
+                new LPDDRSim::Callback<LPMemorySystemTop, bool, unsigned, uint64_t, double, double, double>(this, &LPMemorySystemTop::handle_write_done),
+                new LPDDRSim::Callback<LPMemorySystemTop, bool, unsigned, uint64_t, double, double, double>(this, &LPMemorySystemTop::handle_read_done),
+                new LPDDRSim::Callback<LPMemorySystemTop, bool, unsigned, uint64_t, double, double, double>(this, &LPMemorySystemTop::handle_cmd_done));
+    }
+
 //    rmw = new Rmw(this, hhaId, DDRSim_log, LogPath);
 
     string ddr_type;
@@ -913,6 +927,34 @@ void LPMemorySystemTop::update() {
 //    }
     for (size_t i=0; i<NUM_CHANS; i++) {
         channels[i]->update();
+    }
+
+    if (!top_rdata_fifo.empty()) {
+        TopRespPacket pkt = top_rdata_fifo.front();
+        if (read_cb == NULL || (*read_cb)(pkt.channel, pkt.task, pkt.readDataEnterDmcTime, pkt.reqAddToDmcTime, pkt.reqEnterDmcBufTime)) {
+            top_rdata_fifo.pop_front();
+        }
+    }
+
+    if (!top_wresp_fifo.empty()) {
+        TopRespPacket pkt = top_wresp_fifo.front();
+        if (write_cb == NULL || (*write_cb)(pkt.channel, pkt.task, pkt.readDataEnterDmcTime, pkt.reqAddToDmcTime, pkt.reqEnterDmcBufTime)) {
+            top_wresp_fifo.pop_front();
+        }
+    }
+
+    if (!top_rresp_fifo.empty()) {
+        TopRespPacket pkt = top_rresp_fifo.front();
+        if (read_done_cb == NULL || (*read_done_cb)(pkt.channel, pkt.task, pkt.readDataEnterDmcTime, pkt.reqAddToDmcTime, pkt.reqEnterDmcBufTime)) {
+            top_rresp_fifo.pop_front();
+        }
+    }
+
+    if (!top_cmdresp_fifo.empty()) {
+        TopRespPacket pkt = top_cmdresp_fifo.front();
+        if (cmd_done_cb == NULL || (*cmd_done_cb)(pkt.channel, pkt.task, pkt.readDataEnterDmcTime, pkt.reqAddToDmcTime, pkt.reqEnterDmcBufTime)) {
+            top_cmdresp_fifo.pop_front();
+        }
     }
 
 //    if (RMW_ENABLE) {
@@ -1047,8 +1089,51 @@ void LPMemorySystemTop::RegisterCallbacks(
     TransactionCompleteCB *writeDone,
     TransactionCompleteCB *readDone,
     TransactionCompleteCB *cmdDone ) {
-    for (size_t i=0; i<NUM_CHANS; i++) {
-        channels[i]->RegisterCallbacks(readData, writeDone, readDone, cmdDone);
+    read_cb = readData;
+    write_cb = writeDone;
+    read_done_cb = readDone;
+    cmd_done_cb = cmdDone;
+}
+
+bool LPMemorySystemTop::handle_read_data(unsigned channel, uint64_t task,
+        double readDataEnterDmcTime, double reqAddToDmcTime, double reqEnterDmcBufTime) {
+    if (top_rdata_fifo.size() >= TOP_RESP_FIFO_DEPTH) return false;
+    top_rdata_fifo.push_back({channel, task, readDataEnterDmcTime, reqAddToDmcTime, reqEnterDmcBufTime});
+    return true;
+}
+
+bool LPMemorySystemTop::handle_write_done(unsigned channel, uint64_t task,
+        double readDataEnterDmcTime, double reqAddToDmcTime, double reqEnterDmcBufTime) {
+    if (top_wresp_fifo.size() >= TOP_RESP_FIFO_DEPTH) return false;
+    top_wresp_fifo.push_back({channel, task, readDataEnterDmcTime, reqAddToDmcTime, reqEnterDmcBufTime});
+    return true;
+}
+
+bool LPMemorySystemTop::handle_read_done(unsigned channel, uint64_t task,
+        double readDataEnterDmcTime, double reqAddToDmcTime, double reqEnterDmcBufTime) {
+    if (top_rresp_fifo.size() >= TOP_RESP_FIFO_DEPTH) return false;
+    top_rresp_fifo.push_back({channel, task, readDataEnterDmcTime, reqAddToDmcTime, reqEnterDmcBufTime});
+    return true;
+}
+
+bool LPMemorySystemTop::handle_cmd_done(unsigned channel, uint64_t task,
+        double readDataEnterDmcTime, double reqAddToDmcTime, double reqEnterDmcBufTime) {
+    if (top_cmdresp_fifo.size() >= TOP_RESP_FIFO_DEPTH) return false;
+    top_cmdresp_fifo.push_back({channel, task, readDataEnterDmcTime, reqAddToDmcTime, reqEnterDmcBufTime});
+    return true;
+}
+
+bool LPMemorySystemTop::hasPendingWork() const {
+    if (!top_rdata_fifo.empty() || !top_wresp_fifo.empty() || !top_rresp_fifo.empty() || !top_cmdresp_fifo.empty()) return true;
+    for (auto channel : channels) {
+        if (channel->hasPendingWork()) return true;
+    }
+    return false;
+}
+
+void LPMemorySystemTop::flushWriteMergeBuffers() {
+    for (auto channel : channels) {
+        channel->flushWriteMergeBuffer();
     }
 }
 
@@ -1117,14 +1202,14 @@ void LPMemorySystemTop::command_check(const hha_command &c) {
         ERROR("Error mid value! task="<<c.task<<", mid="<<c.mid);
         assert(0);
     }
-    if (c.channel > NUM_CHANS) {
+    if (c.channel >= NUM_CHANS) {
         ERROR("Error command channel number! task="<<c.task<<", channel="<<c.channel);
         assert(0);
     }
 }
 
 void LPMemorySystemTop::wdata_check(uint64_t task, uint8_t channel) {
-    if (channel > NUM_CHANS) {
+    if (channel >= NUM_CHANS) {
         ERROR("Error wdata channel number! task="<<task<<", channel="<<channel);
         assert(0);
     }
