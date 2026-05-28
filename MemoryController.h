@@ -53,6 +53,8 @@ public:
     void update_even_cycle();
     void noc_read_inform(bool fast_wakeup_rank0, bool fast_wakeup_rank1, bool bus_rempty);
     bool WillAcceptTransaction();
+    bool WillAcceptTransactions(unsigned num);
+    bool HasPendingWork() const;
     bool returnReadData(unsigned int channel_num, unsigned long long task,
             double readDataEnterDmcTime, double reqAddToDmcTime, double reqEnterDmcBufTime);
     void ReturnData_statistics(uint64_t task, uint64_t timeAdded, unsigned qos, unsigned mid, unsigned pf_type, unsigned rank);
