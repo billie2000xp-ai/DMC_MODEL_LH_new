@@ -4,6 +4,8 @@
 #include <time.h>
 #include <bitset>
 #include <random>
+#include <set>
+#include <string>
 
 using namespace LPDDRSim;
 
@@ -12,8 +14,9 @@ vector <vector <hha_command>> CommandQueue;
 vector <hha_command> CommandQueueTest;
 typedef std::list<int> LISTINT;
 std::vector <wdata> write_task;
-std::map <uint64_t, uint32_t> OutstandingQueue;
+std::vector <std::map <uint64_t, uint32_t>> OutstandingQueue;
 std::map <uint64_t, uint32_t> OutstandingQueueTest;
+unsigned cmd_rr_channel = 0;
 std::vector <vector <fastwakeup>> FastWakeupQueue;
 
 uint32_t data_cnt = 0;
@@ -23,6 +26,47 @@ uint64_t cnt = 0;
 uint64_t total_bytes = 0;
 uint64_t trace_send_cnt = 0;
 uint32_t pre_channel = 0;
+uint64_t read_cmd_send_cnt = 0;
+uint64_t write_cmd_send_cnt = 0;
+uint64_t read_data_resp_cnt = 0;
+uint64_t write_resp_cnt = 0;
+uint64_t match_task_limit = 20000;
+unsigned sim_random_seed = 2;
+std::vector<std::set<uint64_t>> SentReadTasks;
+std::vector<std::set<uint64_t>> SentWriteTasks;
+std::vector<std::set<uint64_t>> CompletedReadTasks;
+std::vector<std::set<uint64_t>> CompletedWriteTasks;
+
+bool all_command_queues_empty() {
+    if (!CommandQueueTest.empty()) return false;
+    for (auto &q : CommandQueue) {
+        if (!q.empty()) return false;
+    }
+    return true;
+}
+
+bool outstanding_empty() {
+    if (!OutstandingQueueTest.empty()) return false;
+    for (auto &q : OutstandingQueue) {
+        if (!q.empty()) return false;
+    }
+    return true;
+}
+
+bool memory_pending_empty() {
+    return mem == NULL || !mem->hasPendingWork();
+}
+
+bool memory_accepts_transaction() {
+    for (auto channel : mem->channels) {
+        if (channel->WillAcceptTransaction()) return true;
+    }
+    return false;
+}
+
+void flush_write_merge_buffers() {
+    mem->flushWriteMergeBuffers();
+}
 
 
 ifstream file;
@@ -30,13 +74,13 @@ ifstream file;
 float calc_effi() {
     if (IS_G3D) {
         return (float(100 * total_bytes * 8) / cnt / 2 / JEDEC_DATA_BUS_BITS
-                / WCK2DFI_RATIO / PAM_RATIO / float(NUM_GROUPS));
+                / WCK2DFI_RATIO / PAM_RATIO / float(NUM_GROUPS) / float(NUM_CHANS));
     } else if (IS_LP6) {
         return (float(100 * total_bytes * 8) / cnt / 2 / JEDEC_DATA_BUS_BITS
-                / WCK2DFI_RATIO / PAM_RATIO * 9 / 8);
+                / WCK2DFI_RATIO / PAM_RATIO * 9 / 8 / float(NUM_CHANS));
     } else {
         return (float(100 * total_bytes * 8) / cnt / 2 / JEDEC_DATA_BUS_BITS
-                / WCK2DFI_RATIO / PAM_RATIO);
+                / WCK2DFI_RATIO / PAM_RATIO / float(NUM_CHANS));
     }
 }
 
@@ -44,6 +88,7 @@ float calc_effi() {
 bool some_object::read_data(unsigned channel, uint64_t task, double readDataEnterDmcTime,
         double reqAddToDmcTime, double reqEnterDmcBufTime) {
     total_bytes += DMC_DATA_BUS_BITS / 8;
+    read_data_resp_cnt ++;
     if (LATENCY_MODE) {
         float latency = 0;
         float efficiency = 0;
@@ -72,18 +117,20 @@ bool some_object::read_data(unsigned channel, uint64_t task, double readDataEnte
             }
         }
     }
-    if (task < 0xF000000000000000) {
-        OutstandingQueue[task] --;
-        if (OutstandingQueue[task] == 0) {
-//            if (task==98) {
-//                DEBUG(" task="<<task<<" address="<< &OutstandingQueue[task]); 
-//            }
-//            for (auto &t : OutstandingQueue){
-//                if (t.first == 98){
-//                    DEBUG(" task="<<task<<" first address="<< &(t.first)<<" second address"<<&(t.second)); 
-//                }
-//            }
-            OutstandingQueue.erase(task);
+    if (task < 0xF000000000000000 && channel < OutstandingQueue.size()) {
+        if (SentReadTasks[channel].find(task) == SentReadTasks[channel].end()) {
+            ERROR(setw(10)<<cnt<<" -- read data response task was not sent. task="<<task<<", channel="<<channel);
+            assert(0);
+        }
+        auto it = OutstandingQueue[channel].find(task);
+        if (it == OutstandingQueue[channel].end()) {
+            ERROR(setw(10)<<cnt<<" -- read data response task is not outstanding. task="<<task<<", channel="<<channel);
+            assert(0);
+        }
+        it->second --;
+        if (it->second == 0) {
+            OutstandingQueue[channel].erase(it);
+            CompletedReadTasks[channel].insert(task);
         }
     }
     return true;
@@ -91,14 +138,25 @@ bool some_object::read_data(unsigned channel, uint64_t task, double readDataEnte
 
 bool some_object::write_response(unsigned channel, uint64_t task, double readDataEnterDmcTime_,
         double reqAddToDmcTime_, double reqEnterDmcBufTime_) {
+    write_resp_cnt ++;
     for (auto w : write_task) {
         if (task == w.task) {
             ERROR(setw(10)<<cnt<<" -- task="<<task<<", Wresp receive before all wdata send out!");
             assert(0);
         }
     }
-    if (task < 0xF000000000000000) {
-        OutstandingQueue.erase(task);
+    if (task < 0xF000000000000000 && channel < OutstandingQueue.size()) {
+        if (SentWriteTasks[channel].find(task) == SentWriteTasks[channel].end()) {
+            ERROR(setw(10)<<cnt<<" -- write response task was not sent. task="<<task<<", channel="<<channel);
+            assert(0);
+        }
+        auto it = OutstandingQueue[channel].find(task);
+        if (it == OutstandingQueue[channel].end()) {
+            ERROR(setw(10)<<cnt<<" -- write response task is not outstanding. task="<<task<<", channel="<<channel);
+            assert(0);
+        }
+        OutstandingQueue[channel].erase(it);
+        CompletedWriteTasks[channel].insert(task);
     }
     return true;
 }
@@ -261,8 +319,9 @@ void get_line() {
                 transaction.pf_type = rand() % 4;
                 transaction.sub_pftype = rand() % 13;
                 transaction.sub_src = rand() % 4;
-                CommandQueue[task_cnt / TRACE_Q_MAX_CNT].push_back(transaction);
-                OutstandingQueue[transaction.task] = (transaction.burst_length + 1);
+                unsigned cmd_channel = transaction.channel % NUM_CHANS;
+                CommandQueue[cmd_channel].push_back(transaction);
+                OutstandingQueue[cmd_channel][transaction.task] = transaction.type == DATA_READ ? (transaction.burst_length + 1) : 1;
                 task_cnt ++;
                 if (FASTWAKEUP_CYCLE > 0 && transaction.type == 0) {
                     fastwakeup fw;
@@ -300,8 +359,8 @@ void rand_command(LPMemorySystemTop *ddrc, bool is_test_cmd) {
     } else {
         if (seq_cnt == 0) {
             is_read = (unsigned(rand() % 100) >= WR_RATIO);
-            uint64_t addr_rand = ((uint64_t(rand()) | uint64_t(rand()) << 31) & (0xFFFFFFFFFFFFFFFF << align))
-                    % uint64_t(uint64_t(DRAM_CAPACITY) * 1024 * 1024 * 1024 / 8);
+            uint64_t addr_rand = ((uint64_t(rand()) << 45 | uint64_t(rand()) << 30 | uint64_t(rand()) << 15 | uint64_t(rand()))
+                    & (0xFFFFFFFFFFFFFFFF << align)) % uint64_t(uint64_t(DRAM_CAPACITY) * 1024 * 1024 * 1024 / 8);
             if (RK_SW_RATIO > 0) {
                 if (is_rank0) {
                     transaction.address = addr_rand & ~MATRIX_RA0;
@@ -323,7 +382,7 @@ void rand_command(LPMemorySystemTop *ddrc, bool is_test_cmd) {
     transaction.burst_length = DATA_SIZE * 8 / DMC_DATA_BUS_BITS - 1;
     transaction.id = task_cnt % 1000000;
     if(NUM_CHANS>1){  // lp6 n-mode/dynamic e-mode/combo e-mode
-        transaction.channel = rand() % 2;
+        transaction.channel = rand() % NUM_CHANS;
 //        transaction.channel = 0;
     } else {
         transaction.channel = 0; // lp6 static e-mode/lp5 
@@ -367,16 +426,27 @@ void rand_command(LPMemorySystemTop *ddrc, bool is_test_cmd) {
             transaction.mask_wcmd = (unsigned(rand()) % 100 < MASK_WR_RATIO);
         }
         transaction.reqEnterDmcBufTime = double(cnt + T_DLY);
-        if (OutstandingQueue.size() < BKD_OSTD) {
+        bool chan_credit = OutstandingQueue[transaction.channel].size() < BKD_OSTD;
+        if (!chan_credit && NUM_CHANS > 1) {
+            for (size_t offset = 1; offset < OutstandingQueue.size(); offset++) {
+                unsigned alt_channel = (transaction.channel + offset) % OutstandingQueue.size();
+                if (OutstandingQueue[alt_channel].size() < BKD_OSTD) {
+                    transaction.channel = alt_channel;
+                    chan_credit = true;
+                    break;
+                }
+            }
+        }
+        if (chan_credit) {
             // guarantee balance between two sub channels of a die for lp6
-            if (transaction.channel == pre_channel && VLD_CH_NUM > 0) {
+            if (transaction.channel == pre_channel && VLD_CH_NUM > 0 && NUM_CHANS == 2) {
                 transaction.channel = transaction.channel ^ 0x00000001;      // reverse
 //                transaction.channel = transaction.channel ^ 0x00000000;        // unchanged 
                 
             }
-            CommandQueue[0].push_back(transaction);
+            CommandQueue[transaction.channel].push_back(transaction);
             pre_channel = transaction.channel;
-            OutstandingQueue[transaction.task] = (transaction.burst_length + 1);
+            OutstandingQueue[transaction.channel][transaction.task] = is_read ? (transaction.burst_length + 1) : 1;
             task_cnt ++;
             seq_cnt ++;
             if (seq_cnt == SEQ_NUM) seq_cnt = 0;
@@ -400,6 +470,13 @@ void send_command(LPMemorySystemTop *ddrc) {
             test_cmd_time_met = false;
             bool ret = ddrc->addTransaction(transaction);
             if (ret) {
+                if (transaction.type == DATA_READ) {
+                    SentReadTasks[transaction.channel].insert(transaction.task);
+                    read_cmd_send_cnt ++;
+                } else {
+                    SentWriteTasks[transaction.channel].insert(transaction.task);
+                    write_cmd_send_cnt ++;
+                }
                 if (transaction.type) {
                     for (size_t i = 0; i < transaction.burst_length + 1; i ++) {
                         wdata w_data;
@@ -416,7 +493,8 @@ void send_command(LPMemorySystemTop *ddrc) {
     }
 
     unsigned size = CommandQueue.size();
-    for (size_t i = 0; i < size; i ++) {
+    for (size_t offset = 0; offset < size; offset ++) {
+        size_t i = (cmd_rr_channel + offset) % size;
         if (CommandQueue[i].size() == 0) continue;
         if (test_cmd_time_met && !CommandQueue[i].empty()) {
             if (WRITE_BUFFER_ENABLE) {
@@ -435,6 +513,13 @@ void send_command(LPMemorySystemTop *ddrc) {
                 bool ret = ddrc->addTransaction(transaction);
                 if (ret) {
                     trace_send_cnt ++;
+                    if (transaction.type == DATA_READ) {
+                        SentReadTasks[transaction.channel].insert(transaction.task);
+                        read_cmd_send_cnt ++;
+                    } else {
+                        SentWriteTasks[transaction.channel].insert(transaction.task);
+                        write_cmd_send_cnt ++;
+                    }
                     if (transaction.type) {
                         for (size_t i = 0; i < transaction.burst_length + 1; i ++) {
                             wdata w_data;
@@ -448,6 +533,7 @@ void send_command(LPMemorySystemTop *ddrc) {
                         }
                     }
                     CommandQueue[i].erase(CommandQueue[i].begin());
+                    cmd_rr_channel = (i + 1) % size;
                 }
             }
             break;
@@ -515,6 +601,16 @@ void print_pass() {
 }
 
 int main(int argc, char *argv[]) {
+    for (int i = 1; i < argc; i++) {
+        std::string arg(argv[i]);
+        size_t pos = arg.find('=');
+        if (pos == std::string::npos) continue;
+        std::string key = arg.substr(0, pos);
+        std::string value = arg.substr(pos + 1);
+        if (key == "SIM_RANDOM_SEED") sim_random_seed = unsigned(std::stoul(value));
+        else if (key == "MATCH_TASK_LIMIT") match_task_limit = std::stoull(value);
+    }
+    srand(sim_random_seed);
     get_param_path(argc, argv);
     build_cfg();
     update_cfg(argc, argv);
@@ -538,7 +634,12 @@ int main(int argc, char *argv[]) {
     mem = new LPMemorySystemTop(0, PARAM_PATH, LOG_PATH, argc, argv);
     mem->RegisterCallbacks(rdata_cb, write_cb, read_cb, cmd_cb);
     parameter_check();
-    CommandQueue.resize(1);
+    CommandQueue.resize(NUM_CHANS);
+    OutstandingQueue.resize(NUM_CHANS);
+    SentReadTasks.resize(NUM_CHANS);
+    SentWriteTasks.resize(NUM_CHANS);
+    CompletedReadTasks.resize(NUM_CHANS);
+    CompletedWriteTasks.resize(NUM_CHANS);
 
     if (TRACE_EN || DOU_TRACE_EN) {
         DEBUG("Read from trace file...");
@@ -573,8 +674,6 @@ int main(int argc, char *argv[]) {
             MATRIX_ROW0 = 0x0;
         }
     }
-
-    const uint64_t match_task_limit = 10000;
 
     while (1) {
         if (STOP_WITH_STATETIME && cnt >= STOP_WINDOW * STATE_TIME) {
@@ -622,26 +721,33 @@ int main(int argc, char *argv[]) {
         }
         send_command(mem);
         send_wdata(mem);
+        if (MATCH_MODE && task_cnt >= match_task_limit && trace_send_cnt >= task_cnt && all_command_queues_empty() && write_task.empty() && data_cnt == 0) {
+            flush_write_merge_buffers();
+        }
+        mem->update();
         if (MATCH_MODE) {
-            bool command_queue_empty = true;
-            for (auto &queue : CommandQueue) {
-                if (!queue.empty()) {
-                    command_queue_empty = false;
-                    break;
-                }
+            uint64_t expected_read_data_resp = read_cmd_send_cnt * (DATA_SIZE / (DMC_DATA_BUS_BITS / 8));
+            bool sent_enough = task_cnt >= match_task_limit && (trace_send_cnt >= task_cnt || (all_command_queues_empty() && !memory_accepts_transaction()))
+                    && all_command_queues_empty() && write_task.empty() && data_cnt == 0;
+            bool all_sent_tasks_completed = true;
+            for (size_t i = 0; i < SentReadTasks.size(); i++) {
+                all_sent_tasks_completed &= SentReadTasks[i].size() == CompletedReadTasks[i].size();
+                all_sent_tasks_completed &= SentWriteTasks[i].size() == CompletedWriteTasks[i].size();
             }
-            if (task_cnt >= match_task_limit && OutstandingQueue.empty() && command_queue_empty && write_task.empty()) {
-            //if (task_cnt == 100000) {
+            if (sent_enough
+                    && outstanding_empty() && memory_pending_empty() && read_data_resp_cnt == expected_read_data_resp
+                    && write_resp_cnt == write_cmd_send_cnt && all_sent_tasks_completed) {
                 float efficiency = 0;
                 efficiency = calc_effi();
                 DEBUG("Done, time: "<<cnt<<", efficiency: "<<fixed<<setprecision(2)<<efficiency<<"%");
+                DEBUG("MATCH_MODE drain checked: send R/W="<<read_cmd_send_cnt<<"/"<<write_cmd_send_cnt
+                        <<", resp read_data/write="<<read_data_resp_cnt<<"/"<<write_resp_cnt);
                 DEBUG("Power Consumption: "<<fixed<<mem->channels[0]->memoryController->calc_power());
                 delete mem;
                 print_pass();
                 exit(0);
             }
         }
-        mem->update();
         cnt ++;
     }
     return 0;
