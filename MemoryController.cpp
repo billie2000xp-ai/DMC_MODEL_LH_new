@@ -9333,7 +9333,7 @@ void MemoryController::trans_state_init(Transaction *trans) {
     trans->reqAddToDmcTime = now() * tDFI;
     trans->arb_time = now() + tCMD2SCH;
     trans->enter_que_time = now() + tCMD_CONF;
-    trans->data_ready_cnt = 0;
+    trans->data_ready_cnt = (trans->transactionType == DATA_WRITE) ? (trans->burst_length + 1) : 0;
 
     string mpam_timeout, mpam_adapt;
     unsigned timeout = 0, pri_adapt = 0;
