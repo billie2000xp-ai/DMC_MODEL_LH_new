@@ -76,6 +76,7 @@ class Inline_ECC:public SimulatorObject {
     bool ecc_try_add_wr_trans(Transaction * trans, uint32_t ecc_buf_id);
     bool try_add_ecc_rd(Transaction * trans, uint32_t ecc_buf_id);
     bool try_add_ecc_wr(Transaction * trans, uint32_t ecc_buf_id);
+    void release_pending_ecc_wdata(uint64_t task);
     void update();
     void get_pdu_addr(ECC_BUF_Entry *buf, Transaction *trans);
 
@@ -87,6 +88,12 @@ class Inline_ECC:public SimulatorObject {
     std::vector<ECC_BUF_Entry> wr_ecc_buf;
     std::map<uint32_t, bool> index_recycle_rd_ecc_buf;
     std::map<uint32_t, bool> index_recycle_wr_ecc_buf;
+    struct pending_ecc_wdata {
+        uint64_t task;
+        unsigned beats;
+        pending_ecc_wdata(uint64_t task_, unsigned beats_) : task(task_), beats(beats_) {}
+    };
+    std::map<uint64_t, std::vector<pending_ecc_wdata> > pending_ecc_wdatas;
     uint32_t avail_rd_ecc_buf_id;
     uint32_t avail_wr_ecc_buf_id;
     uint32_t counter;
