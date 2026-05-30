@@ -302,6 +302,7 @@ void Inline_ECC::update_wr_ecc_buf() {
             auto it = top->tasks_info.find(wr_ecc_buf.at(index).task_list.at(i));
             if (it != top->tasks_info.end()) {
                 if (it->second.wr_finish) {
+                    release_pending_ecc_wdata(wr_ecc_buf.at(index).task_list.at(i));
                     wr_ecc_buf.at(index).slt_cnt--;
                     top->tasks_info.erase(wr_ecc_buf.at(index).task_list.at(i));
                     wr_ecc_buf.at(index).task_list.erase(wr_ecc_buf.at(
@@ -320,6 +321,15 @@ void Inline_ECC::update_wr_ecc_buf() {
             }
         }
     }
+}
+//==============================================================================
+void Inline_ECC::release_pending_ecc_wdata(uint64_t task) {
+    auto it = pending_ecc_wdatas.find(task);
+    if (it == pending_ecc_wdatas.end()) return;
+    for (auto &pending : it->second) {
+        top->parentMemorySystem->addWriteDataPending(pending.task, pending.beats, true);
+    }
+    pending_ecc_wdatas.erase(it);
 }
 //==============================================================================
 bool Inline_ECC::ecc_try_add_rd_trans(Transaction * trans, uint32_t rd_ecc_buf_id) {
@@ -489,7 +499,11 @@ bool Inline_ECC::try_add_ecc_wr(Transaction * trans, uint32_t wr_ecc_buf_id) {
         wr_ecc_buf.at(wr_ecc_buf_id).slt_cnt++;
         wr_ecc_buf.at(wr_ecc_buf_id).buf_ctrl_state = WAIT_WRECC_BACK;
         top->parentMemorySystem->write_map[trans_wr_ecc->task] = msg_wr_ecc;
-        top->parentMemorySystem->addWriteDataPending(trans_wr_ecc->task, msg_wr_ecc.num_256bit, true);
+        if (PDU_PUSH_MODE && trans->transactionType == DATA_WRITE && !trans->mask_wcmd) {
+            pending_ecc_wdatas[trans->task].push_back(pending_ecc_wdata(trans_wr_ecc->task, msg_wr_ecc.num_256bit));
+        } else {
+            top->parentMemorySystem->addWriteDataPending(trans_wr_ecc->task, msg_wr_ecc.num_256bit, true);
+        }
         ecc_task++;
         ecc_conflict_cnt = IECC_CONFLICT_CNT;
         ecc_merge_flag = false;
@@ -931,6 +945,7 @@ bool Inline_ECC::addData(uint32_t *data ,uint64_t task) {
 }
 
 void Inline_ECC::update() {
+    update_wr_ecc_buf();
     show_buf_state();
     return; // Delete
 
