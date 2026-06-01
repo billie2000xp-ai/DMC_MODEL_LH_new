@@ -378,7 +378,7 @@ bool MemorySystem::submitTransaction(Transaction *trans) {
                     <<" mask="<<trans->mask_wcmd<<" ecc="<<trans->ecc_flag<<" burst="<<trans->burst_length
                     <<" addr=0x"<<hex<<trans->address<<dec<<" write_map_size="<<write_map.size()<<endl);
         }
-        if (trans->transactionType != DATA_READ) {
+        if (trans->transactionType != DATA_READ && trans->data_ready_cnt <= trans->burst_length) {
             write_map[trans->task] = msg;
         }
     } else {
@@ -488,7 +488,6 @@ Transaction *MemorySystem::build_merged_write_transaction(WriteMergeEntry &entry
     merged->burst_length = mask_wcmd ? ((first->burst_length + 1) * 2 - 1)
             : ((first->burst_length + 1) + (upper->burst_length + 1) - 1);
     merged->data_size = (merged->burst_length + 1) * DMC_DATA_BUS_BITS / 8;
-    merged->data_ready_cnt = 0;
     return merged;
 }
 
@@ -530,17 +529,9 @@ bool MemorySystem::dispatch_write_merge_entry(size_t index, bool force_mask_wcmd
     }
 
     if (entry.has_second) {
-        if (entry.first_data_ready_cnt > 0) pending_write_merge_datas.push_back(PendingWriteMergeData(dispatch_task, entry.first_data_ready_cnt));
-        if (entry.second_data_ready_cnt > 0) pending_write_merge_datas.push_back(PendingWriteMergeData(dispatch_task, entry.second_data_ready_cnt));
-        if (entry.first_trans->task != dispatch_task && entry.first_data_ready_cnt < first_beats) {
-            write_merge_data_remaps.push_back(WriteMergeDataRemap(entry.first_trans->task, dispatch_task, first_beats - entry.first_data_ready_cnt));
-        }
-        if (entry.second_trans->task != dispatch_task && entry.second_data_ready_cnt < second_beats) {
-            write_merge_data_remaps.push_back(WriteMergeDataRemap(entry.second_trans->task, dispatch_task, second_beats - entry.second_data_ready_cnt));
-        }
-        if (entry.first_data_ready_cnt < first_beats) {
-            pending_write_merge_resps.push_back(PendingWriteMergeResp(entry.first_trans->task, entry.upstream_channel, entry.first_trans->task));
-        } else if (!write_merge_response(entry.first_trans->task, entry.upstream_channel)) {
+        entry.first_data_ready_cnt = first_beats;
+        entry.second_data_ready_cnt = second_beats;
+        if (!write_merge_response(entry.first_trans->task, entry.upstream_channel)) {
             pending_write_merge_resps.push_back(PendingWriteMergeResp(entry.first_trans->task, entry.upstream_channel));
         }
         totalWriteMergePair++;
@@ -552,10 +543,7 @@ bool MemorySystem::dispatch_write_merge_entry(size_t index, bool force_mask_wcmd
                     <<" second_ready="<<entry.second_data_ready_cnt<<"/"<<second_beats<<endl);
         }
     } else if (mask_wcmd) {
-        if (entry.first_data_ready_cnt > 0) pending_write_merge_datas.push_back(PendingWriteMergeData(dispatch_task, entry.first_data_ready_cnt));
-        if (entry.first_data_ready_cnt < first_beats) {
-            write_merge_data_remaps.push_back(WriteMergeDataRemap(entry.first_trans->task, dispatch_task, first_beats - entry.first_data_ready_cnt));
-        }
+        entry.first_data_ready_cnt = first_beats;
         totalWriteMergeUnpairedToRmw++;
         if (DEBUG_BUS) {
             PRINTN(setw(10)<<now()<<" -- WCMERGE_UNPAIRED_MASK_DISPATCH :: src_task="<<entry.first_trans->task
@@ -564,7 +552,7 @@ bool MemorySystem::dispatch_write_merge_entry(size_t index, bool force_mask_wcmd
         }
         delete entry.first_trans;
     } else {
-        if (entry.first_data_ready_cnt > 0) pending_write_merge_datas.push_back(PendingWriteMergeData(dispatch_task, entry.first_data_ready_cnt));
+        entry.first_data_ready_cnt = first_beats;
         totalWriteMergeUnpairedDirect++;
         if (DEBUG_BUS) {
             PRINTN(setw(10)<<now()<<" -- WCMERGE_UNPAIRED_DIRECT_DISPATCH :: task="<<dispatch_task
@@ -633,6 +621,9 @@ bool MemorySystem::handle_write_merge_transaction(Transaction *trans) {
             }
             pump_write_merge_buffer();
             return true;
+        }
+        if (tail.first_data_ready_cnt > tail.first_trans->burst_length && write_merge_buffer.size() < WRITE_MERGE_BUFFER_DEPTH) {
+            return false;
         }
     }
     if (write_merge_buffer.size() >= WRITE_MERGE_BUFFER_DEPTH) {
@@ -819,8 +810,8 @@ bool MemorySystem::addData(uint32_t *data ,uint64_t taskId, bool ecc_flag) {
                         <<trans_fifo_data_cnt<<" last_wdata_time="<<memoryController->pre_req_data_time<<endl);
             }
 
-            // two cycle one data when trans fifo full
-            if (memoryController->pre_req_data_time == memoryController->now() || ((memoryController->pre_req_data_time + 1) == memoryController->now())) {
+            if (memoryController->pre_req_data_time == memoryController->now()
+                    || (JEDEC_DATA_BUS_BITS != 32 && ((memoryController->pre_req_data_time + 1) == memoryController->now()))) {
                 if (DEBUG_BUS) {
                     PRINTN(setw(10)<<now()<<" -- WDATA :: BP Wdata, one data two cyle under full trans fifo :: task="<<taskId
                                 <<" last_wdata_time="<<memoryController->pre_req_data_time<<endl);
