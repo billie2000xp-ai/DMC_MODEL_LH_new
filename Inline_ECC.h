@@ -102,6 +102,8 @@ class Inline_ECC:public SimulatorObject {
     uint64_t pdu_addr = 0;
     uint32_t ecc_delay = 0;
     ECC_MODEL_STATE ecc_pre_state;
+    Transaction *pdu_push_pending_trans;
+    uint32_t pdu_push_pending_wr_ecc_buf_id;
 
     unsigned iecc_cmd_cnt;
     unsigned iecc_wdata_cnt;
