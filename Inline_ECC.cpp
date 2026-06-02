@@ -61,6 +61,8 @@ Inline_ECC::Inline_ECC(MemoryController *_top,unsigned id, ostream &DDRSim_log_)
     ecc_merge_flag=false;
     ecc_model_state = TRY_HIT_ECC_BUF;
     ecc_pre_state = TRY_HIT_ECC_BUF;
+    pdu_push_pending_trans = NULL;
+    pdu_push_pending_wr_ecc_buf_id = 0xffff;
     avail_rd_ecc_buf_id = 0xffff;
     avail_wr_ecc_buf_id = 0xffff;
     pdu_addr = 0;
@@ -89,6 +91,10 @@ Inline_ECC::~Inline_ECC() {
     wr_ecc_buf.clear();
     index_recycle_rd_ecc_buf.clear();
     index_recycle_wr_ecc_buf.clear();
+    if (pdu_push_pending_trans != NULL) {
+        delete pdu_push_pending_trans;
+        pdu_push_pending_trans = NULL;
+    }
     assert(this->index_recycle_rd_ecc_buf.empty());//make sure clear the index_recycle_ecc_buf
     assert(this->index_recycle_wr_ecc_buf.empty());//make sure clear the index_recycle_ecc_buf
 
@@ -696,15 +702,14 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
                 }
             } else if (trans_cmd->transactionType == DATA_WRITE) {
                 bool pdu_push_wr = PDU_PUSH_MODE && !trans->mask_wcmd;
-                if (pdu_push_wr && !top->WillAcceptTransactions(2)) return false;
+                if (pdu_push_wr && !top->WillAcceptTransactions(1)) return false;
                 if (ecc_try_add_wr_trans(trans_cmd, avail_wr_ecc_buf_id)) {
                     if (pdu_push_wr) {
-                        if (try_add_ecc_wr(trans, avail_wr_ecc_buf_id)) {
-                            ecc_model_state = TRY_HIT_ECC_BUF;
-                            ecc_pre_state = ADD_WR_ECC_TRANS;
-                        } else {
-                            ecc_model_state = ADD_WR_ECC_TRANS;
-                        }
+                        if (pdu_push_pending_trans != NULL) delete pdu_push_pending_trans;
+                        pdu_push_pending_trans = new Transaction(trans);
+                        pdu_push_pending_wr_ecc_buf_id = avail_wr_ecc_buf_id;
+                        ecc_model_state = TRY_HIT_ECC_BUF;
+                        ecc_pre_state = ADD_WR_ECC_TRANS;
                     } else {
                         ecc_model_state = TRY_HIT_ECC_BUF;
                     }
@@ -902,6 +907,16 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
 }
 
 bool Inline_ECC::addTransaction(Transaction * trans) {
+    if (pdu_push_pending_trans != NULL) {
+        if (try_add_ecc_wr(pdu_push_pending_trans, pdu_push_pending_wr_ecc_buf_id)) {
+            delete pdu_push_pending_trans;
+            pdu_push_pending_trans = NULL;
+            pdu_push_pending_wr_ecc_buf_id = 0xffff;
+            ecc_model_state = TRY_HIT_ECC_BUF;
+            ecc_pre_state = ADD_WR_ECC_TRANS;
+        }
+        return false;
+    }
     return (proc_iecc(trans, now())); // Delete
 
     if (WRITE_BUFFER_ENABLE) {
