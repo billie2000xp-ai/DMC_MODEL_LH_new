@@ -861,6 +861,7 @@ MemoryController::MemoryController(MemorySystem *parent, ostream &DDRSim_log_,
         }
     }
     grp_sid_level = MAP_CONFIG["GRP_SID_LEVEL"];
+    rcmd_bp_byrp = false;
 
 //    DEBUG(now()<<" after ini, sc_num="<<sc_num);
 }
@@ -1329,18 +1330,15 @@ void MemoryController::fresh_timing(const BusPacket &bus_packet,bool hit) {
 //    DEBUG(now()<<" sc="<<sub_channel<<" sc_bank_num="<<sc_bank_num<<" NUM_BANKS="<<NUM_BANKS<<" sc_num="<<sc_num);
     unsigned bank_start = sub_channel * NUM_BANKS / sc_num;
 //    unsigned bank_pair_start = sub_channel * pbr_bank_num;
-    BusPacket timing_packet = bus_packet;
-    if (timing_packet.type == WRITE_MASK_CMD) timing_packet.type = WRITE_CMD;
-    else if (timing_packet.type == WRITE_MASK_P_CMD) timing_packet.type = WRITE_P_CMD;
     unsigned rw_intlv_cnt = 0;
-    if (timing_packet.type >= WRITE_CMD && timing_packet.type <= READ_P_CMD) {
+    if (bus_packet.type >= WRITE_CMD && bus_packet.type <= READ_P_CMD) {
         bankStates[bus_packet.bankIndex].state->rwIntlvCountdown = BL_n_min[bus_packet.bl];
     }
     for (auto &state : bankStates) {
         if (state.state->rwIntlvCountdown > 0) rw_intlv_cnt ++;
     }
     unsigned trp_pb = bus_packet.fg_ref ? tRPfg : tRPpb;
-    switch (timing_packet.type) {
+    switch (bus_packet.type) {
         case READ_CMD :
         case READ_P_CMD :{     //todo: revise for e-mode
             for (auto &state : bankStates) {
@@ -4994,8 +4992,8 @@ unsigned MemoryController::priority(Cmd *cmd) {
         }
         case LPDDRSim::ACTIVATE2_CMD : {
             if (IS_LP5 || IS_LP6 || IS_GD2) {
-//                level_ret = 500;
-                level_ret = 9999;
+                level_ret = 500;
+                // level_ret = 9999;
             } else if (IS_LP4) {
                 level_ret = 9999;
             } else if (IS_DDR5 || IS_DDR4 || IS_GD1 || IS_G3D) {
@@ -7296,6 +7294,7 @@ void MemoryController::que_pipeline() {
             if (bank != trans->bankIndex) continue;
             if (trans->row != bankStates[bank].state->openRowAddress) continue;
             if (bankStates[bank].has_rhit_break) continue;
+            if (trans->transactionType == DATA_READ && rcmd_bp_byrp && bank == trans->bankIndex) break;
             if ((rw_group_state[0] == NO_GROUP && !GRP_RANK_EN) || (rk_grp_state == NO_RGRP && !GRP_RW_EN)) {
                 bankStates[bank].hold_precharge = true;
                 if (DEBUG_BUS) {
@@ -7341,21 +7340,6 @@ void MemoryController::que_pipeline() {
             if (bankStates[trans->bankIndex].state->currentBankState != RowActive) continue;
             if (trans->row == bankStates[trans->bankIndex].state->openRowAddress) continue;
             if (tout_high_pri <= trans->pri) {
-                bool same_bank_timeout_rowhit = false;
-                for (auto &t : transactionQueue) {
-                    if (t->addrconf) continue;
-                    if (t->pre_act) continue;
-                    if (now() < t->arb_time) continue;
-                    if (t->bp_by_tout) continue;
-                    if (!t->timeout) continue;
-                    if (t->bankIndex != trans->bankIndex) continue;
-                    if (t->row != bankStates[t->bankIndex].state->openRowAddress) continue;
-                    if (t->pri <= trans->pri) {
-                        same_bank_timeout_rowhit = true;
-                        break;
-                    }
-                }
-                if (same_bank_timeout_rowhit) continue;
                 bankStates[trans->bankIndex].hold_precharge = false;
                 if (DEBUG_BUS) {
                     PRINTN(setw(10)<<now()<<" -- HPRE :: Timeout set hold_precharge false, task="
@@ -7586,67 +7570,190 @@ void MemoryController::data_fresh() {
         }
     }
 
-    //check for outstanding data to return to the CPU
     size = read_data_buffer.size();
-    for (size_t i = 0; i < size; i ++) {
-        if (0 == read_data_buffer[i].delay) {
-            unsigned long long task = read_data_buffer[i].task;
-            if (DEBUG_BUS) {
-                PRINTN(setw(10)<<now()<<" -- T_CPU :: Issuing to CPU bus, task="<<task<<endl);
-            }
-            auto it = pending_TransactionQue.find(task);
-            if (it == pending_TransactionQue.end()) {
-                ERROR(setw(10)<<now()<<" -- [DMC"<<channel<<"]"<<" mismatch data, task="<<task);
-                assert(0);
-//                read_data_buffer.erase(read_data_buffer.begin() + i);
-//                break;
-            }
+    bool sys_bp = false;
+    bool rpfifo_write_this_cycle = false;
+    if (rp_fifo.empty()) {
+        for (size_t i = 0; i < size; i ++) {
+            if (0 == read_data_buffer[i].delay) {
+                unsigned long long task = read_data_buffer[i].task;
+                if (DEBUG_BUS) {
+                    PRINTN(setw(10)<<now()<<" -- T_CPU :: Issuing to CPU bus, task="<<task<<endl);
+                }
+                auto it = pending_TransactionQue.find(task);
+                if (it == pending_TransactionQue.end()) {
+                    ERROR(setw(10)<<now()<<" -- [DMC"<<channel<<"]"<<" mismatch data, task="<<task);
+                    assert(0);
+                }
 
-            TRANS_MSG msg = it->second;
-            msg.burst_cnt ++;
-            read_data_buffer[i].channel = msg.channel;
+                TRANS_MSG msg = it->second;
+                msg.burst_cnt ++;
+                read_data_buffer[i].channel = msg.channel;
 #ifdef SYSARCH_PLATFORM
-            unsigned rdata_type = 0;
-            if (msg.burst_cnt == (msg.burst_length + 1)) rdata_type |= 1; // bit[0] is rdata_end
-            if (msg.burst_cnt == 0) rdata_type |= (1 << 1); // bit[1] is rdata_start
-            rdata_type |= (msg.qos << 2); // bit[5:2] is qos
-            rdata_type |= (msg.pf_type << 6); // bit[7:6] is pf_type
-            rdata_type |= (msg.sub_pftype << 8); // bit[11:8] is pf_type
-            rdata_type |= (msg.sub_src << 12); // bit[13:12] is pf_type
-            msg.reqAddToDmcTime = double(rdata_type);
+                unsigned rdata_type = 0;
+                if (msg.burst_cnt == (msg.burst_length + 1)) rdata_type |= 1; // bit[0] is rdata_end
+                if (msg.burst_cnt == 0) rdata_type |= (1 << 1); // bit[1] is rdata_start
+                rdata_type |= (msg.qos << 2); // bit[5:2] is qos
+                rdata_type |= (msg.pf_type << 6); // bit[7:6] is pf_type
+                rdata_type |= (msg.sub_pftype << 8); // bit[11:8] is pf_type
+                rdata_type |= (msg.sub_src << 12); // bit[13:12] is pf_type
+                msg.reqAddToDmcTime = double(rdata_type);
 #endif
-            if ((!IECC_ENABLE || !tasks_info[task].rd_ecc) && (!RMW_ENABLE || (!read_data_buffer[i].mask_wcmd && RMW_ENABLE))) {
-                read_data_buffer[i].readDataEnterDmcTime = now() * tDFI;
-                if (!returnReadData(read_data_buffer[i].channel, task,
-                        read_data_buffer[i].readDataEnterDmcTime,
-                        msg.reqAddToDmcTime, msg.reqEnterDmcBufTime)) {
-                    if (PRINT_READ) {
-                        TRACE_PRINT(setw(10)<<now()<<" -- Rdata Back Pressure :: task="<<task<<" ch="<<channel<<endl);
-                    }
-                    if (DEBUG_BUS) {
-                        PRINTN(setw(10)<<now()<<" -- Rdata Back Pressure :: task="<<task<<" ch="<<channel<<endl);
-                    }
-                    return;
-                } else {
-                    pre_rdata_time = now();
-                    rdata_cnt ++;
-                    if (PRINT_READ) {
-                        TRACE_PRINT(setw(10)<<now()<<" -- Rdata Received :: task="<<task<<", latency="
-                                <<ceil(((read_data_buffer[i].readDataEnterDmcTime
-                                - msg.reqEnterDmcBufTime) / tDFI))<<" ch="<<channel<<endl);
-                    }
-                    if (PRINT_IDLE_LAT) {
-                        DEBUG(setw(10)<<now()<<" -- Rdata Received :: task="<<task<<", latency="
-                                <<ceil(((read_data_buffer[i].readDataEnterDmcTime
-                                - msg.reqEnterDmcBufTime) / tDFI)));
-                    }
-                    if (DEBUG_BUS) {
-                        PRINTN(setw(10)<<now()<<" -- Rdata Received :: task="<<task<<", latency="
-                                <<ceil(((read_data_buffer[i].readDataEnterDmcTime
-                                - msg.reqEnterDmcBufTime) / tDFI))<<endl);
+                if ((!IECC_ENABLE || !tasks_info[task].rd_ecc) && (!RMW_ENABLE || (!read_data_buffer[i].mask_wcmd && RMW_ENABLE))) {
+                    read_data_buffer[i].readDataEnterDmcTime = now() * tDFI;
+                    sys_bp = !returnReadData(read_data_buffer[i].channel, task,
+                            read_data_buffer[i].readDataEnterDmcTime,
+                            msg.reqAddToDmcTime, msg.reqEnterDmcBufTime);
+                    if (sys_bp) {
+                        if (PRINT_READ) {
+                            TRACE_PRINT(setw(10)<<now()<<" -- Rdata Back Pressure :: task="<<task<<" ch="<<channel<<endl);
+                        }
+                        if (DEBUG_BUS) {
+                            PRINTN(setw(10)<<now()<<" -- Rdata Back Pressure :: task="<<task<<" ch="<<channel<<endl);
+                        }
+                        if (!RPFIFO_EN) {
+                            return;
+                        } else {
+                            rp_fifo.push_back(read_data_buffer[i]);
+                            rpfifo_write_this_cycle = true;
+                            if (DEBUG_BUS) {
+                                PRINTN(setw(10)<<now()<<" -- Rdata to rp_fifo, task="<<task<<", rp_fifo_size="<<rp_fifo.size()<<endl);
+                            }
+                        }
+                    } else {
+                        pre_rdata_time = now();
+                        rdata_cnt ++;
+                        if (PRINT_READ) {
+                            TRACE_PRINT(setw(10)<<now()<<" -- Rdata Received :: task="<<task<<", latency="
+                                    <<ceil(((read_data_buffer[i].readDataEnterDmcTime
+                                    - msg.reqEnterDmcBufTime) / tDFI))<<" ch="<<channel<<endl);
+                        }
+                        if (PRINT_IDLE_LAT) {
+                            DEBUG(setw(10)<<now()<<" -- Rdata Received :: task="<<task<<", latency="
+                                    <<ceil(((read_data_buffer[i].readDataEnterDmcTime
+                                    - msg.reqEnterDmcBufTime) / tDFI)));
+                        }
+                        if (DEBUG_BUS) {
+                            PRINTN(setw(10)<<now()<<" -- Rdata Received :: task="<<task<<", latency="
+                                    <<ceil(((read_data_buffer[i].readDataEnterDmcTime
+                                    - msg.reqEnterDmcBufTime) / tDFI))<<endl);
+                        }
                     }
                 }
+                if (!sys_bp) {
+                    if (msg.burst_cnt == (msg.burst_length + 1)) {
+                        ReturnData_statistics(task, msg.time, msg.qos, msg.mid, msg.pf_type, msg.rank);
+                    }
+                    //return latency
+                    if (msg.burst_cnt == (msg.burst_length + 1)) {
+                        pending_TransactionQue.erase(task);
+                        if (IECC_ENABLE) tasks_info[task].rd_finish = true;
+                        if (RMW_ENABLE && read_data_buffer[i].mask_wcmd==true) {
+                            auto iter = rmw_rd_finish.find(task);
+                            if (iter == rmw_rd_finish.end()){
+                                ERROR(setw(10)<<now()<<" -- Merge Read Data Mismatch, task="<<task);
+                                assert(0);
+                            }
+                            rmw_rd_finish[task] = true;
+                        }
+                        if (DEBUG_BUS) {
+                            PRINTN(setw(10)<<now()<<" -- Finish :: Issuing to CPU bus, task="<<task<<endl);
+                        }
+                    } else {
+                        it->second.burst_cnt = msg.burst_cnt;
+                    }
+                }
+                read_data_buffer.erase(read_data_buffer.begin() + i);
+                break;
+            } else {
+                if (IS_G3D) break;
             }
+        }
+    } else {
+        if (!rpfifo_write_this_cycle) {
+            for (size_t i = 0; i < size; i ++) {
+                if (0 == read_data_buffer[i].delay) {
+                    unsigned long long task = read_data_buffer[i].task;
+                    if (rp_fifo.size() < RPFIFO_AMFULL_TH) {
+                        rp_fifo.push_back(read_data_buffer[i]);
+                        rpfifo_write_this_cycle = true;
+                        read_data_buffer.erase(read_data_buffer.begin() + i);
+                        if (DEBUG_BUS) {
+                            PRINTN(setw(10)<<now()<<" -- Rdata to rp_fifo, task="<<task<<", rpfifosize="<<rp_fifo.size()<<endl);
+                        }
+                    } else if (rp_fifo.size() < RPFIFO_DEPTH) {
+                        rp_fifo.push_back(read_data_buffer[i]);
+                        rpfifo_write_this_cycle = true;
+                        rcmd_bp_byrp = true;
+                        read_data_buffer.erase(read_data_buffer.begin() + i);
+                        if (DEBUG_BUS) {
+                            PRINTN(setw(10)<<now()<<" -- Rcmd bp, Rdata to rp_fifo, task="<<task<<", rpfifosize="<<rp_fifo.size()<<endl);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        auto return_rdata = rp_fifo.front();
+        unsigned long long task = return_rdata.task;
+        if (DEBUG_BUS) {
+            PRINTN(setw(10)<<now()<<" -- T_CPU :: Issuing to CPU bus, from rp_fifo, task="<<task<<endl);
+        }
+        auto it = pending_TransactionQue.find(task);
+        if (it == pending_TransactionQue.end()) {
+            ERROR(setw(10)<<now()<<" -- [DMC"<<channel<<"]"<<" mismatch data, task="<<task);
+            assert(0);
+        }
+
+        TRANS_MSG msg = it->second;
+        msg.burst_cnt ++;
+        return_rdata.channel = msg.channel;
+#ifdef SYSARCH_PLATFORM
+        unsigned rdata_type = 0;
+        if (msg.burst_cnt == (msg.burst_length + 1)) rdata_type |= 1; // bit[0] is rdata_end
+        if (msg.burst_cnt == 0) rdata_type |= (1 << 1); // bit[1] is rdata_start
+        rdata_type |= (msg.qos << 2); // bit[5:2] is qos
+        rdata_type |= (msg.pf_type << 6); // bit[7:6] is pf_type
+        rdata_type |= (msg.sub_pftype << 8); // bit[11:8] is pf_type
+        rdata_type |= (msg.sub_src << 12); // bit[13:12] is pf_type
+        msg.reqAddToDmcTime = double(rdata_type);
+#endif
+        if ((!IECC_ENABLE || !tasks_info[task].rd_ecc)) {
+            return_rdata.readDataEnterDmcTime = now() * tDFI;
+            sys_bp = !returnReadData(return_rdata.channel, task,
+                    return_rdata.readDataEnterDmcTime,
+                    msg.reqAddToDmcTime, msg.reqEnterDmcBufTime);
+            if (sys_bp) {
+                if (PRINT_READ) {
+                    TRACE_PRINT(setw(10)<<now()<<" -- Rdata Back Pressure :: task="<<task<<" ch="<<channel<<endl);
+                }
+                if (DEBUG_BUS) {
+                    PRINTN(setw(10)<<now()<<" -- Rdata from rpfifo Back Pressure :: task="<<task<<" ch="<<channel<<endl);
+                }
+                return;
+            } else {
+                pre_rdata_time = now();
+                rdata_cnt ++;
+                if (PRINT_READ) {
+                    TRACE_PRINT(setw(10)<<now()<<" -- Rdata Received from rpfifo :: task="<<task<<", latency="
+                            <<ceil(((return_rdata.readDataEnterDmcTime
+                            - msg.reqEnterDmcBufTime) / tDFI))<<" ch="<<channel<<endl);
+                }
+                if (PRINT_IDLE_LAT) {
+                    DEBUG(setw(10)<<now()<<" -- Rdata Received from rpfifo :: task="<<task<<", latency="
+                            <<ceil(((return_rdata.readDataEnterDmcTime
+                            - msg.reqEnterDmcBufTime) / tDFI)));
+                }
+                if (DEBUG_BUS) {
+                    PRINTN(setw(10)<<now()<<" -- Rdata Received from rpfifo:: task="<<task<<", latency="
+                            <<ceil(((return_rdata.readDataEnterDmcTime
+                            - msg.reqEnterDmcBufTime) / tDFI))<<endl);
+                }
+            }
+        }
+
+        if (!sys_bp) {
             if (msg.burst_cnt == (msg.burst_length + 1)) {
                 ReturnData_statistics(task, msg.time, msg.qos, msg.mid, msg.pf_type, msg.rank);
             }
@@ -7654,7 +7761,7 @@ void MemoryController::data_fresh() {
             if (msg.burst_cnt == (msg.burst_length + 1)) {
                 pending_TransactionQue.erase(task);
                 if (IECC_ENABLE) tasks_info[task].rd_finish = true;
-                if (RMW_ENABLE && read_data_buffer[i].mask_wcmd==true)  {
+                if (RMW_ENABLE && return_rdata.mask_wcmd==true) {
                     auto iter = rmw_rd_finish.find(task);
                     if (iter == rmw_rd_finish.end()){
                         ERROR(setw(10)<<now()<<" -- Merge Read Data Mismatch, task="<<task);
@@ -7668,12 +7775,19 @@ void MemoryController::data_fresh() {
             } else {
                 it->second.burst_cnt = msg.burst_cnt;
             }
-            read_data_buffer.erase(read_data_buffer.begin() + i);
-            break;
-        } else {
-            if (IS_G3D) break;
+
+            unsigned task = rp_fifo.front().task;
+            rp_fifo.pop_front();
+            if (DEBUG_BUS) {
+                PRINTN(setw(10)<<now()<<" -- Rdata from rp_fifo to upstream, task="<<task<<", rpfifosize="<<rp_fifo.size()<<endl);
+            }
         }
     }
+
+    if (rp_fifo.size() < RPFIFO_AMFULL_TH) {
+        rcmd_bp_byrp = false;
+    }
+
     size = read_data_buffer.size();
     for (size_t i = 0; i < size; i++) {
         if (read_data_buffer[i].delay > 0) read_data_buffer[i].delay--;
@@ -8112,21 +8226,18 @@ void MemoryController::CalcBl(Transaction *t) {
         t->trans_size = max_bl_data_size - t->addr_col % max_bl_data_size;
         if (t->data_size - t->issue_size < t->trans_size) t->trans_size = t->data_size - t->issue_size;
     } else {
-        bool short_iecc_write = IECC_ENABLE && t->ecc_flag && (t->data_size - t->issue_size < min_bl_data_size);
         // address aligned check for lpddr
         if ((t->addr_col % min_bl_data_size != 0) && (IS_LP5 || IS_LP6 || IS_LP4)){
             ERROR(setw(10)<<now()<<" -- Address not 32B aligned, task="<<t->task);
             assert(0);
         }
         // Dif between data_size and issue_size check for lpddr
-        if ((t->data_size - t->issue_size < min_bl_data_size) && !short_iecc_write && (IS_LP5 || IS_LP6 || IS_LP4)){
+        if ((t->data_size - t->issue_size < min_bl_data_size) && (IS_LP5 || IS_LP6 || IS_LP4)){
             ERROR(setw(10)<<now()<<" -- Issue size wrong, task="<<t->task);
             assert(0);
         }
 
-        if (short_iecc_write) {
-            t->trans_size = t->data_size - t->issue_size;
-        } else if (t->mask_wcmd && !IS_LP6) {                                     //mask write condition, addr_col 32B aligned, up to mask_wcmd
+        if (t->mask_wcmd && !IS_LP6) {                                     //mask write condition, addr_col 32B aligned, up to mask_wcmd
             if (t->issue_size == 0) {                                      //first must be BL16 mask write
                 t->trans_size = min_bl_data_size;
             } else {  
@@ -8379,6 +8490,12 @@ void MemoryController::lc(Transaction *t) {
         return;
     }
 
+    if (t->transactionType==DATA_READ && rcmd_bp_byrp) {
+        if (DEBUG_BUS) {
+            PRINTN(setw(10)<<now()<<" -- LC :: backpress by rpram, task="<<t->task<<endl);
+        }
+        return;
+    }
 
     need_issue(t);
 
