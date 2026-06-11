@@ -488,6 +488,7 @@ Transaction *MemorySystem::build_merged_write_transaction(WriteMergeEntry &entry
     merged->burst_length = mask_wcmd ? ((first->burst_length + 1) * 2 - 1)
             : ((first->burst_length + 1) + (upper->burst_length + 1) - 1);
     merged->data_size = (merged->burst_length + 1) * DMC_DATA_BUS_BITS / 8;
+    merged->data_ready_cnt = 0;
     return merged;
 }
 
@@ -529,9 +530,17 @@ bool MemorySystem::dispatch_write_merge_entry(size_t index, bool force_mask_wcmd
     }
 
     if (entry.has_second) {
-        entry.first_data_ready_cnt = first_beats;
-        entry.second_data_ready_cnt = second_beats;
-        if (!write_merge_response(entry.first_trans->task, entry.upstream_channel)) {
+        if (entry.first_data_ready_cnt > 0) pending_write_merge_datas.push_back(PendingWriteMergeData(dispatch_task, entry.first_data_ready_cnt));
+        if (entry.second_data_ready_cnt > 0) pending_write_merge_datas.push_back(PendingWriteMergeData(dispatch_task, entry.second_data_ready_cnt));
+        if (entry.first_trans->task != dispatch_task && entry.first_data_ready_cnt < first_beats) {
+            write_merge_data_remaps.push_back(WriteMergeDataRemap(entry.first_trans->task, dispatch_task, first_beats - entry.first_data_ready_cnt));
+        }
+        if (entry.second_trans->task != dispatch_task && entry.second_data_ready_cnt < second_beats) {
+            write_merge_data_remaps.push_back(WriteMergeDataRemap(entry.second_trans->task, dispatch_task, second_beats - entry.second_data_ready_cnt));
+        }
+        if (entry.first_data_ready_cnt < first_beats) {
+            pending_write_merge_resps.push_back(PendingWriteMergeResp(entry.first_trans->task, entry.upstream_channel, entry.first_trans->task));
+        } else if (!write_merge_response(entry.first_trans->task, entry.upstream_channel)) {
             pending_write_merge_resps.push_back(PendingWriteMergeResp(entry.first_trans->task, entry.upstream_channel));
         }
         totalWriteMergePair++;
@@ -543,7 +552,10 @@ bool MemorySystem::dispatch_write_merge_entry(size_t index, bool force_mask_wcmd
                     <<" second_ready="<<entry.second_data_ready_cnt<<"/"<<second_beats<<endl);
         }
     } else if (mask_wcmd) {
-        entry.first_data_ready_cnt = first_beats;
+        if (entry.first_data_ready_cnt > 0) pending_write_merge_datas.push_back(PendingWriteMergeData(dispatch_task, entry.first_data_ready_cnt));
+        if (entry.first_data_ready_cnt < first_beats) {
+            write_merge_data_remaps.push_back(WriteMergeDataRemap(entry.first_trans->task, dispatch_task, first_beats - entry.first_data_ready_cnt));
+        }
         totalWriteMergeUnpairedToRmw++;
         if (DEBUG_BUS) {
             PRINTN(setw(10)<<now()<<" -- WCMERGE_UNPAIRED_MASK_DISPATCH :: src_task="<<entry.first_trans->task
@@ -552,7 +564,7 @@ bool MemorySystem::dispatch_write_merge_entry(size_t index, bool force_mask_wcmd
         }
         delete entry.first_trans;
     } else {
-        entry.first_data_ready_cnt = first_beats;
+        if (entry.first_data_ready_cnt > 0) pending_write_merge_datas.push_back(PendingWriteMergeData(dispatch_task, entry.first_data_ready_cnt));
         totalWriteMergeUnpairedDirect++;
         if (DEBUG_BUS) {
             PRINTN(setw(10)<<now()<<" -- WCMERGE_UNPAIRED_DIRECT_DISPATCH :: task="<<dispatch_task
@@ -572,12 +584,17 @@ bool MemorySystem::pump_write_merge_buffer() {
     if (!write_merge_buffer.empty() && write_merge_buffer[0].paired_tail) {
         write_merge_buffer.erase(write_merge_buffer.begin());
     }
-    if (!write_merge_buffer.empty() && write_merge_buffer[0].has_second) {
-        return dispatch_write_merge_entry(0, false);
+    for (size_t i = 0; i < write_merge_buffer.size(); i++) {
+        if (write_merge_buffer[i].has_second) {
+            return dispatch_write_merge_entry(i, false);
+        }
     }
-    if (!write_merge_buffer.empty() && write_merge_buffer[0].first_trans != NULL &&
-            write_merge_buffer[0].first_data_ready_cnt > write_merge_buffer[0].first_trans->burst_length) {
-        return dispatch_write_merge_entry(0, UNPAIRED_TO_RMW_EN);
+    return false;
+}
+
+bool MemorySystem::has_paired_write_merge_entry() const {
+    for (size_t i = 0; i < write_merge_buffer.size(); i++) {
+        if (write_merge_buffer[i].has_second) return true;
     }
     return false;
 }
@@ -608,22 +625,20 @@ bool MemorySystem::hasPendingWork() const {
 
 bool MemorySystem::handle_write_merge_transaction(Transaction *trans) {
     pump_write_merge_buffer();
-    if (!write_merge_buffer.empty()) {
-        WriteMergeEntry &tail = write_merge_buffer.back();
-        if (!tail.has_second && !tail.paired_tail && can_merge_write_pair(tail.first_trans, trans)) {
-            tail.second_trans = trans;
-            tail.has_second = true;
+    if (has_paired_write_merge_entry()) return false;
+    for (size_t i = 0; i < write_merge_buffer.size(); i++) {
+        WriteMergeEntry &entry = write_merge_buffer[i];
+        if (!entry.has_second && !entry.paired_tail && can_merge_write_pair(entry.first_trans, trans)) {
+            entry.second_trans = trans;
+            entry.has_second = true;
             totalWriteMergeInput++;
             if (DEBUG_BUS) {
-                PRINTN(setw(10)<<now()<<" -- WCMERGE_PAIR_HIT :: first_task="<<tail.first_trans->task
-                        <<" second_task="<<trans->task<<" first_addr=0x"<<hex<<tail.first_trans->address
+                PRINTN(setw(10)<<now()<<" -- WCMERGE_PAIR_HIT :: first_task="<<entry.first_trans->task
+                        <<" second_task="<<trans->task<<" first_addr=0x"<<hex<<entry.first_trans->address
                         <<" second_addr=0x"<<trans->address<<dec<<" used="<<write_merge_buffer.size()<<endl);
             }
-            pump_write_merge_buffer();
+            dispatch_write_merge_entry(i, false);
             return true;
-        }
-        if (tail.first_data_ready_cnt > tail.first_trans->burst_length && write_merge_buffer.size() < WRITE_MERGE_BUFFER_DEPTH) {
-            return false;
         }
     }
     if (write_merge_buffer.size() >= WRITE_MERGE_BUFFER_DEPTH) {
@@ -734,10 +749,11 @@ bool MemorySystem::addTransaction(Transaction *trans) {
     if (is_write_merge_candidate(trans)) {
         return handle_write_merge_transaction(trans);
     }
-    if (!write_merge_buffer.empty()) {
+    if (has_paired_write_merge_entry()) {
         pump_write_merge_buffer();
         return false;
     }
+    pump_write_merge_buffer();
     return submitTransaction(trans);
 }
 //==============================================================================
@@ -1566,6 +1582,33 @@ void MemorySystem::statistics() {
         }
         STATE_PRINTN(endl);
     }
+    uint64_t bank_total = 0;
+    uint64_t bank_min = 0;
+    uint64_t bank_max = 0;
+    unsigned bank_active = 0;
+    double bank_sum_pwr2 = 0;
+    for (size_t bank = 0; bank < NUM_RANKS * NUM_BANKS; bank ++) {
+        uint64_t acc = memoryController->acc_bank_cnt[bank];
+        if (acc == 0) continue;
+        if (bank_active == 0 || acc < bank_min) bank_min = acc;
+        if (bank_active == 0 || acc > bank_max) bank_max = acc;
+        bank_total += acc;
+        bank_sum_pwr2 += double(acc) * double(acc);
+        bank_active ++;
+    }
+    double bank_mean = (bank_active == 0) ? 0 : double(bank_total) / bank_active;
+    double bank_var = (bank_active == 0) ? 0 : bank_sum_pwr2 / bank_active - bank_mean * bank_mean;
+    if (bank_var < 0) bank_var = 0;
+    double bank_std = sqrt(bank_var);
+    double bank_cv = (bank_mean == 0) ? 0 : bank_std / bank_mean;
+    double bank_max_min = (bank_min == 0) ? 0 : double(bank_max) / double(bank_min);
+    STATE_PRINTN("Bank Balance    : active="<<setw(8)<<bank_active);
+    STATE_PRINTN(" | mean="<<setw(12)<<fixed<<setprecision(2)<<bank_mean);
+    STATE_PRINTN(" | std="<<setw(12)<<fixed<<setprecision(2)<<bank_std);
+    STATE_PRINTN(" | cv="<<setw(12)<<fixed<<setprecision(4)<<bank_cv);
+    STATE_PRINTN(" | min="<<setw(8)<<bank_min);
+    STATE_PRINTN(" | max="<<setw(8)<<bank_max);
+    STATE_PRINTN(" | max/min="<<setw(8)<<fixed<<setprecision(4)<<bank_max_min<<" |"<<endl);
     STATE_PRINTN("-------------------- Row Conflict Precharge Count (Counter) ---------------------------\n");
     for (size_t bank = 0; bank < NUM_RANKS * NUM_BANKS; bank ++) {
         STATE_PRINTN("Bank"<<setw(2)<<bank<<" "<<setw(13)<<"RowConfPre");
