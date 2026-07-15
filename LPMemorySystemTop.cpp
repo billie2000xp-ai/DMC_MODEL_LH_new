@@ -25,6 +25,9 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
     write_cb = NULL;
     read_done_cb = NULL;
     cmd_done_cb = NULL;
+    top_rdata_active = false;
+    top_rdata_task = 0;
+    top_rdata_remain = 0;
 
 #ifdef SYSARCH_PLATFORM
     IniFilename = "parameter/public.ini";
@@ -67,6 +70,7 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
     BA_SHIFT_DIR = cfg->getBool("BA_SHIFT_DIR");
     BA_SHIFT_BIT = cfg->getNumber("BA_SHIFT_BIT");
     SLOT_FIFO = cfg->getBool("SLOT_FIFO");
+    DMC_RW_SYNC_EN = cfg->getBool("DMC_RW_SYNC_EN");
     TIME_ASSERT_EN = cfg->getBool("TIME_ASSERT_EN");
 
     IniFilename = "parameter/" + SYSTEM_CONFIG + ".ini";
@@ -273,6 +277,7 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
     EM_MODE = cfg->getNumber("EM_MODE");
     RMW_ENABLE = cfg->getBool("RMW_ENABLE");
     RMW_CMD_MODE = cfg->getNumber("RMW_CMD_MODE");
+    WCMD_DATA_READY_MODE = cfg->getNumber("WCMD_DATA_READY_MODE");
     RMW_QUE_DEPTH = cfg->getNumber("RMW_QUE_DEPTH");
     RMW_CONF_SIZE = cfg->getNumber("RMW_CONF_SIZE");
     GRT_FIFO_DEPTH = cfg->getNumber("GRT_FIFO_DEPTH");
@@ -280,7 +285,14 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
     ROW_SEL = cfg->getNumber("ROW_SEL");
     WCMD_MERGE_EN = cfg->getBool("WCMD_MERGE_EN");
     WRITE_MERGE_BUFFER_DEPTH = cfg->getNumber("WRITE_MERGE_BUFFER_DEPTH");
+    WRITE_MERGE_TIMEOUT = cfg->getNumber("WRITE_MERGE_TIMEOUT");
     UNPAIRED_TO_RMW_EN = cfg->getBool("UNPAIRED_TO_RMW_EN");
+    RPFIFO_EN = cfg->getBool("RPFIFO_EN");
+    RPFIFO_DEPTH = cfg->getNumber("RPFIFO_DEPTH");
+    RPFIFO_AMFULL_TH = cfg->getNumber("RPFIFO_AMFULL_TH");
+    WCMDPRI_ADAPT_EN = cfg->getBool("WCMDPRI_ADAPT_EN");
+    RDATA_MERGE_EN = cfg->getBool("RDATA_MERGE_EN");
+    MERGE_DATA_SIZE = cfg->getNumber("MERGE_DATA_SIZE");
 
     IniFilename = "parameter/" + DDR_TYPE + "_" + to_string(DMC_RATE) + "M" + DDR_MODE + ".ini";
     if (hhaId == 0) DEBUG("== Loading device model file '"<<IniFilename<<"' ==");
@@ -348,6 +360,7 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
     GET_PARAM(BA_SHIFT_DIR, "BA_SHIFT_DIR", getBool);
     GET_PARAM(BA_SHIFT_BIT, "BA_SHIFT_BIT", getUint);
     GET_PARAM(SLOT_FIFO, "SLOT_FIFO", getBool);
+    GET_PARAM(DMC_RW_SYNC_EN, "DMC_RW_SYNC_EN", getBool);
     GET_PARAM(TIME_ASSERT_EN, "TIME_ASSERT_EN", getBool);
 
     IniFilename = IniFilePath + "/" + SYSTEM_CONFIG + ".ini";
@@ -559,6 +572,7 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
     GET_PARAM(EM_MODE, "EM_MODE", getUint);
     GET_PARAM(RMW_ENABLE, "RMW_ENABLE", getBool);
     GET_PARAM(RMW_CMD_MODE, "RMW_CMD_MODE", getUint);
+    GET_PARAM(WCMD_DATA_READY_MODE, "WCMD_DATA_READY_MODE", getUint);
     GET_PARAM(RMW_QUE_DEPTH, "RMW_QUE_DEPTH", getUint);
     GET_PARAM(RMW_CONF_SIZE, "RMW_CONF_SIZE", getUint);
     GET_PARAM(GRT_FIFO_DEPTH, "GRT_FIFO_DEPTH", getUint);
@@ -566,7 +580,14 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
     GET_PARAM(ROW_SEL, "ROW_SEL", getUint);
     GET_PARAM(WCMD_MERGE_EN, "WCMD_MERGE_EN", getBool);
     GET_PARAM(WRITE_MERGE_BUFFER_DEPTH, "WRITE_MERGE_BUFFER_DEPTH", getUint);
+    GET_PARAM(WRITE_MERGE_TIMEOUT, "WRITE_MERGE_TIMEOUT", getUint);
     GET_PARAM(UNPAIRED_TO_RMW_EN, "UNPAIRED_TO_RMW_EN", getBool);
+    GET_PARAM(RPFIFO_EN, "RPFIFO_EN", getBool);
+    GET_PARAM(RPFIFO_DEPTH, "RPFIFO_DEPTH", getUint);
+    GET_PARAM(RPFIFO_AMFULL_TH, "RPFIFO_AMFULL_TH", getUint);
+    GET_PARAM(WCMDPRI_ADAPT_EN, "WCMDPRI_ADAPT_EN", getBool);
+    GET_PARAM(RDATA_MERGE_EN, "RDATA_MERGE_EN", getBool);
+    GET_PARAM(MERGE_DATA_SIZE, "MERGE_DATA_SIZE", getUint);
 
     IniFilename = IniFilePath+"/"+DDR_TYPE+"_"+to_string(DMC_RATE)+"M"+DDR_MODE+".ini";
     if (hhaId == 0) DEBUG("== Loading device model file '"<<IniFilename<<"' ==");
@@ -925,33 +946,83 @@ void LPMemorySystemTop::update() {
 //    if (RMW_ENABLE) {
 //        rmw->update();
 //    }
-    for (size_t i=0; i<NUM_CHANS; i++) {
+    for (size_t i = 0; i < NUM_CHANS; i++) {
         channels[i]->update();
     }
 
+    // Top 层的串行化向上游发送逻辑 (仲裁与汇聚吐出)
+    // 1. 吐出 Read Data
+    bool top_rdata_ready_to_send = true;
     if (!top_rdata_fifo.empty()) {
-        TopRespPacket pkt = top_rdata_fifo.front();
-        if (read_cb == NULL || (*read_cb)(pkt.channel, pkt.task, pkt.readDataEnterDmcTime, pkt.reqAddToDmcTime, pkt.reqEnterDmcBufTime)) {
-            top_rdata_fifo.pop_front();
+        size_t idx = 0;
+        if (!top_rdata_active) {
+            unsigned chunk_beats = RDATA_MERGE_EN ? (MERGE_DATA_SIZE / (DMC_DATA_BUS_BITS / 8)) : 1;
+            if (chunk_beats == 0) chunk_beats = 1;
+            for (size_t cand = 0; cand < top_rdata_fifo.size(); cand++) {
+                uint64_t cand_task = top_rdata_fifo[cand].task;                
+                unsigned remaining_beats = 1;
+                auto it = expected_read_beats_map.find(cand_task);
+                if (it != expected_read_beats_map.end()) {
+                    remaining_beats = it->second;
+                }
+                
+                unsigned target_beats = chunk_beats;
+                if (remaining_beats > 0 && remaining_beats < chunk_beats) {
+                    target_beats = remaining_beats;
+                }
+
+                unsigned ready_beats = 0;
+                for (const auto &pkt : top_rdata_fifo) {
+                    if (pkt.task == cand_task) ready_beats++;
+                }
+                
+                if (ready_beats >= target_beats) {
+                    top_rdata_task = cand_task;
+                    idx = cand;
+                    top_rdata_active = true;
+                    top_rdata_remain = target_beats; 
+                    break;
+                }
+            }
+            if (!top_rdata_active) {
+                top_rdata_ready_to_send = false;
+            }
+        } else {
+            while (idx < top_rdata_fifo.size() && top_rdata_fifo[idx].task != top_rdata_task) idx++;
+        }
+        if (top_rdata_ready_to_send && idx < top_rdata_fifo.size()) {
+            TopRespPacket pkt = top_rdata_fifo[idx];
+            if (read_cb == NULL || (*read_cb)(pkt.channel, pkt.task, pkt.readDataEnterDmcTime, pkt.reqAddToDmcTime, pkt.reqEnterDmcBufTime)) {
+                top_rdata_fifo.erase(top_rdata_fifo.begin() + idx);
+                auto it2 = expected_read_beats_map.find(pkt.task);
+                if (it2 != expected_read_beats_map.end()) {
+                    if (it2->second > 0) it2->second--;
+                    if (it2->second == 0) expected_read_beats_map.erase(it2);
+                }
+                if (--top_rdata_remain == 0) top_rdata_active = false;
+            }
         }
     }
 
+    // 2. 吐出 Write Response
     if (!top_wresp_fifo.empty()) {
-        TopRespPacket pkt = top_wresp_fifo.front();
+        auto &pkt = top_wresp_fifo.front();
         if (write_cb == NULL || (*write_cb)(pkt.channel, pkt.task, pkt.readDataEnterDmcTime, pkt.reqAddToDmcTime, pkt.reqEnterDmcBufTime)) {
             top_wresp_fifo.pop_front();
         }
     }
 
+    // 3. 吐出 Read Response
     if (!top_rresp_fifo.empty()) {
-        TopRespPacket pkt = top_rresp_fifo.front();
+        auto &pkt = top_rresp_fifo.front();
         if (read_done_cb == NULL || (*read_done_cb)(pkt.channel, pkt.task, pkt.readDataEnterDmcTime, pkt.reqAddToDmcTime, pkt.reqEnterDmcBufTime)) {
             top_rresp_fifo.pop_front();
         }
     }
 
+    // 4. 吐出 Cmd Response
     if (!top_cmdresp_fifo.empty()) {
-        TopRespPacket pkt = top_cmdresp_fifo.front();
+        auto &pkt = top_cmdresp_fifo.front();
         if (cmd_done_cb == NULL || (*cmd_done_cb)(pkt.channel, pkt.task, pkt.readDataEnterDmcTime, pkt.reqAddToDmcTime, pkt.reqEnterDmcBufTime)) {
             top_cmdresp_fifo.pop_front();
         }
@@ -1008,7 +1079,13 @@ bool LPMemorySystemTop::addTransaction(const hha_command &command) {
     Transaction *trans = new Transaction(command);
 //    trans_init(trans, now());
 
-    addressMapping(*trans);
+    if (command.type == DATA_READ) {
+        expected_read_beats_map[command.task] = trans->burst_length + 1;
+    }
+    if (!trans->bypass_addr_mapping) {
+        addressMapping(*trans);
+    }
+    // addressMapping(*trans);
     trans_check(trans);
     
 //    if (RMW_ENABLE && !trans->pre_act) {
@@ -1021,6 +1098,9 @@ bool LPMemorySystemTop::addTransaction(const hha_command &command) {
         }
 
     if (!ret){
+        if (command.type == DATA_READ) {
+            expected_read_beats_map.erase(command.task);
+        }
         delete trans;
     }
     
@@ -1097,7 +1177,32 @@ void LPMemorySystemTop::RegisterCallbacks(
 
 bool LPMemorySystemTop::handle_read_data(unsigned channel, uint64_t task,
         double readDataEnterDmcTime, double reqAddToDmcTime, double reqEnterDmcBufTime) {
-    if (top_rdata_fifo.size() >= TOP_RESP_FIFO_DEPTH) return false;
+    if (top_rdata_fifo.size() >= TOP_RESP_FIFO_DEPTH) return false; 
+
+    unsigned remaining_beats = 1;
+    auto it = expected_read_beats_map.find(task);
+    if (it != expected_read_beats_map.end()) {
+        remaining_beats = it->second;
+    }
+
+    if (RDATA_MERGE_EN) {
+        bool task_exists = false;
+        for (const auto &pkt : top_rdata_fifo) {
+            if (pkt.task == task) {
+                task_exists = true;
+                break;
+            }
+        }
+        unsigned chunk_beats = MERGE_DATA_SIZE / (DMC_DATA_BUS_BITS / 8);
+        if (chunk_beats == 0) chunk_beats = 1;
+        
+        unsigned occupy_beats = chunk_beats;
+        if (remaining_beats > 0 && remaining_beats < chunk_beats) {
+            occupy_beats = remaining_beats;
+        }
+        if (!task_exists && top_rdata_fifo.size() + occupy_beats > TOP_RESP_FIFO_DEPTH) return false;
+    }
+
     top_rdata_fifo.push_back({channel, task, readDataEnterDmcTime, reqAddToDmcTime, reqEnterDmcBufTime});
     return true;
 }
