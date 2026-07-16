@@ -277,7 +277,6 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
     EM_MODE = cfg->getNumber("EM_MODE");
     RMW_ENABLE = cfg->getBool("RMW_ENABLE");
     RMW_CMD_MODE = cfg->getNumber("RMW_CMD_MODE");
-    WCMD_DATA_READY_MODE = cfg->getNumber("WCMD_DATA_READY_MODE");
     RMW_QUE_DEPTH = cfg->getNumber("RMW_QUE_DEPTH");
     RMW_CONF_SIZE = cfg->getNumber("RMW_CONF_SIZE");
     GRT_FIFO_DEPTH = cfg->getNumber("GRT_FIFO_DEPTH");
@@ -572,7 +571,6 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
     GET_PARAM(EM_MODE, "EM_MODE", getUint);
     GET_PARAM(RMW_ENABLE, "RMW_ENABLE", getBool);
     GET_PARAM(RMW_CMD_MODE, "RMW_CMD_MODE", getUint);
-    GET_PARAM(WCMD_DATA_READY_MODE, "WCMD_DATA_READY_MODE", getUint);
     GET_PARAM(RMW_QUE_DEPTH, "RMW_QUE_DEPTH", getUint);
     GET_PARAM(RMW_CONF_SIZE, "RMW_CONF_SIZE", getUint);
     GET_PARAM(GRT_FIFO_DEPTH, "GRT_FIFO_DEPTH", getUint);
@@ -946,8 +944,32 @@ void LPMemorySystemTop::update() {
 //    if (RMW_ENABLE) {
 //        rmw->update();
 //    }
-    for (size_t i = 0; i < NUM_CHANS; i++) {
-        channels[i]->update();
+    if (DMC_RW_SYNC_EN && NUM_CHANS >= 2) {
+        // 第一步：先不执行 update，收集所有通道当前的读写切换灰度状态
+        bool global_rw_switch_gray = false; 
+        for (size_t i = 0; i < NUM_CHANS; i++) {
+            if (channels[i]->memoryController->IsRWGray()) {
+                global_rw_switch_gray = true;
+                break;
+            }
+        }
+        // 第二步：Master 只接收灰度信号（决定它自己的 LC 是否要拦截），不接收外部的 Target Group
+        channels[0]->memoryController->SetRwSyncHint(false, NO_GROUP, global_rw_switch_gray);
+        // channels[0]->memoryController->SetRwSyncHint(false, NO_GROUP, false);
+        channels[0]->update();
+        MemoryController *master = channels[0]->memoryController;
+        for (size_t i = 1; i < NUM_CHANS; i++) {
+            channels[i]->memoryController->SetRwSyncHint(true,
+                    master->GetRwGroupTarget(),
+                    global_rw_switch_gray);
+                    // false);
+            channels[i]->update();
+        }
+    } else {
+        for (size_t i = 0; i < NUM_CHANS; i++) {
+            channels[i]->memoryController->SetRwSyncHint(false, NO_GROUP, false);
+            channels[i]->update();
+        }
     }
 
     // Top 层的串行化向上游发送逻辑 (仲裁与汇聚吐出)
@@ -1082,10 +1104,8 @@ bool LPMemorySystemTop::addTransaction(const hha_command &command) {
     if (command.type == DATA_READ) {
         expected_read_beats_map[command.task] = trans->burst_length + 1;
     }
-    if (!trans->bypass_addr_mapping) {
-        addressMapping(*trans);
-    }
-    // addressMapping(*trans);
+
+    addressMapping(*trans);
     trans_check(trans);
     
 //    if (RMW_ENABLE && !trans->pre_act) {
