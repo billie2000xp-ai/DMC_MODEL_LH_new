@@ -1,16 +1,3 @@
-/* $$$!!Warning: Huawei key information asset. No spread without permission.$$$ */
-/* CODEMARK:RKeR1B8WMAfemkt1tTDGp4eOEddgxKn4NOPmdw0w+6Q3n1pxgDEX+kGBiRV20e1NKuLwOh60qWwx
-7DOUvTqsDpJdC/G6ahMCQuRlwWqc+IGKquH6vaaGAGe1zSmcLn5FMd2VBk0upEP5xKZPTVuBjKnw
-SvZMzBtMrQ+w1lxbG5+EFWux51V2bvtZUTAAA+en/pM7ZB5Cy3u0JTs1VqxXwqMjrJOEtXGbL1nL
-eG+oIO5+Iy3h9huLaKZf275DpuHUuN9eW3kM/4ja8UYF4+kEY7qvpVTnLs4yswU2fjNI8e84dsbP
-X0TqHR+9ZSlf0IyS# */
-/* $$$!!Warning: Deleting or modifying the preceding information is prohibited.$$$ */
-/*
-* Copyright @ Huawei Technologies Co., Ltd. 2019-2029. All rights reserved.
-* Description: AddressMapping.cpp
-* Author: l00434636
-* Create: 2020-10-27
-*/
 
 #include "SystemConfiguration.h"
 #include "AddressMapping.h"
