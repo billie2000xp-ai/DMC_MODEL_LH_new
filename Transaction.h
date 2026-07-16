@@ -153,6 +153,13 @@ struct hha_command {
     uint32_t pri;
     uint32_t qos;
     uint32_t id;
+    uint32_t sid;
+    uint32_t group;
+    uint32_t rank;
+    uint32_t sc;
+    uint32_t bank;
+    uint32_t row;
+    uint32_t col;
     uint32_t channel;
     uint64_t task;
     double   reqEnterDmcBufTime;
@@ -164,6 +171,8 @@ struct hha_command {
     bool     ap_cmd;
     bool     mask_wcmd;
     bool     wrap_cmd;
+    bool     mergeflag;
+    bool     bypass_addrmapping;
     unsigned pf_type;//0:DMD, 1:PFL1, 2:PFL2, 3:PFL3
     unsigned sub_pftype;//0:NonPf, 1:SEQ, 2:STRIDE, 3:SMS, 4:NL, 5:PCP, 6:BBOP,
                         //7:IFUPF, 8:META, 9:BOF, 10:PF_MAX, 11:CONTEXT, 12:SPP
@@ -180,6 +189,13 @@ struct hha_command {
         pri = 0;
         qos = 0;
         id = 0;
+        sid = 0;
+        group = 0;
+        rank = 0;
+        sc = 0;
+        bank = 0;
+        row = 0;
+        col = 0;
         channel = 0;
         task = 0;
         reqEnterDmcBufTime = 0.0;
@@ -191,6 +207,8 @@ struct hha_command {
         ap_cmd = false;
         mask_wcmd = false;
         wrap_cmd = false;
+        mergeflag = true;
+        bypass_addrmapping = false;
         pf_type = 0;
         sub_pftype = 0;
         sub_src = 0;
@@ -322,6 +340,8 @@ public:
     bool     ap_cmd;
     bool     mask_wcmd;
     bool     wrap_cmd;
+    bool     mergeflag;
+    bool     bypass_addrmapping;
     unsigned pf_type;
     unsigned sub_pftype;
     unsigned sub_src;
@@ -331,6 +351,7 @@ public:
     unsigned bl;
     uint32_t arb_group;
     bool     lqos_bp;
+    bool     is_addr_expanded;
 
     friend ostream &operator<<(ostream &os, const Transaction &t);
     //functions
