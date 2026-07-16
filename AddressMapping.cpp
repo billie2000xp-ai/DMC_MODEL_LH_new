@@ -1,3 +1,17 @@
+/* $$$!!Warning: Huawei key information asset. No spread without permission.$$$ */
+/* CODEMARK:RKeR1B8WMAfemkt1tTDGp4eOEddgxKn4NOPmdw0w+6Q3n1pxgDEX+kGBiRV20e1NKuLwOh60qWwx
+7DOUvTqsDpJdC/G6ahMCQuRlwWqc+IGKquH6vaaGAGe1zSmcLn5FMd2VBk0upEP5xKZPTVuBjKnw
+SvZMzBtMrQ+w1lxbG5+EFWux51V2bvtZUTAAA+en/pM7ZB5Cy3u0JTs1VqxXwqMjrJOEtXGbL1nL
+eG+oIO5+Iy3h9huLaKZf275DpuHUuN9eW3kM/4ja8UYF4+kEY7qvpVTnLs4yswU2fjNI8e84dsbP
+X0TqHR+9ZSlf0IyS# */
+/* $$$!!Warning: Deleting or modifying the preceding information is prohibited.$$$ */
+/*
+* Copyright @ Huawei Technologies Co., Ltd. 2019-2029. All rights reserved.
+* Description: AddressMapping.cpp
+* Author: l00434636
+* Create: 2020-10-27
+*/
+
 #include "SystemConfiguration.h"
 #include "AddressMapping.h"
 #include <assert.h>
@@ -33,10 +47,14 @@ void addressMapping(Transaction &trans) {
     ra0 = bit_xor(MATRIX_RA0, trans.address);
     ra1 = bit_xor(MATRIX_RA1, trans.address);
     ra2 = bit_xor(MATRIX_RA2, trans.address);
-    trans.rank = ra0 | (ra1<<1) | (ra2<<2);
-    
+    if (!trans.bypass_addrmapping) {
+        trans.rank = ra0 | (ra1<<1) | (ra2<<2);
+    }
+
     ch = bit_xor(MATRIX_CH, trans.address);
-    trans.sc = ch;
+    if (!trans.bypass_addrmapping) {
+        trans.sc = ch;
+    }
 
     row0 = bit_xor(MATRIX_ROW0, trans.address);
     row1 = bit_xor(MATRIX_ROW1, trans.address);
@@ -62,10 +80,16 @@ void addressMapping(Transaction &trans) {
     row21 = bit_xor(MATRIX_ROW21, trans.address);
     row22 = bit_xor(MATRIX_ROW22, trans.address);
     row23 = bit_xor(MATRIX_ROW23, trans.address);
-    trans.row = row0 | (row1<<1) | (row2<<2) | (row3<<3) | (row4<<4) | (row5<<5) | (row6<<6) | (row7<<7) |
+    if (!trans.bypass_addrmapping) {
+        trans.row = row0 | (row1<<1) | (row2<<2) | (row3<<3) | (row4<<4) | (row5<<5) | (row6<<6) | (row7<<7) |
             (row8<<8) | (row9<<9) | (row10<<10) | (row11<<11) | (row12<<12) | (row13<<13) | (row14<<14) |
             (row15<<15) | (row16<<16) | (row17<<17) | (row18<<18) | (row19<<19) | (row20<<20) |
             (row21<<21) | (row22<<22) | (row23<<23);
+    }
+    // trans.row = row0 | (row1<<1) | (row2<<2) | (row3<<3) | (row4<<4) | (row5<<5) | (row6<<6) | (row7<<7) |
+    //         (row8<<8) | (row9<<9) | (row10<<10) | (row11<<11) | (row12<<12) | (row13<<13) | (row14<<14) |
+    //         (row15<<15) | (row16<<16) | (row17<<17) | (row18<<18) | (row19<<19) | (row20<<20) |
+    //         (row21<<21) | (row22<<22) | (row23<<23);
 
     bitset<32> row_addr(trans.row);
     // swap row_swl bit of row address with sc bit under combo e-mode
@@ -91,7 +115,9 @@ void addressMapping(Transaction &trans) {
     bg2 = (EM_ENABLE && DMC_RATE>6400) ? trans.sc : bit_xor(MATRIX_BG2, trans.address);   // bg2 under e-mode
     bg3 = bit_xor(MATRIX_BG3, trans.address);
     bg4 = bit_xor(MATRIX_BG4, trans.address);
-    trans.group = bg0 | (bg1<<1) | (bg2<<2) | (bg3<<3) | (bg4<<4);
+    if (!trans.bypass_addrmapping) {
+        trans.group = bg0 | (bg1<<1) | (bg2<<2) | (bg3<<3) | (bg4<<4);
+    }
 
     ba0 = bit_xor(MATRIX_BA0, trans.address);
     ba1 = bit_xor(MATRIX_BA1, trans.address);
@@ -100,7 +126,9 @@ void addressMapping(Transaction &trans) {
     ba4 = (EM_ENABLE && DMC_RATE<=6400) ? trans.sc : bit_xor(MATRIX_BA4, trans.address);   // ba4 under e-mode
     ba5 = bit_xor(MATRIX_BA5, trans.address);
     ba6 = bit_xor(MATRIX_BA6, trans.address);
-    trans.bank = ba0 | (ba1<<1) | (ba2<<2) | (ba3<<3) | (ba4<<4) | (ba5<<5) | (ba6<<6);
+    if (!trans.bypass_addrmapping) {
+        trans.bank = ba0 | (ba1<<1) | (ba2<<2) | (ba3<<3) | (ba4<<4) | (ba5<<5) | (ba6<<6);
+    }
 
     col0 = bit_xor(MATRIX_COL0, trans.address);
     col1 = bit_xor(MATRIX_COL1, trans.address);
@@ -113,8 +141,10 @@ void addressMapping(Transaction &trans) {
     col8 = bit_xor(MATRIX_COL8, trans.address);
     col9 = bit_xor(MATRIX_COL9, trans.address);
     col10 = bit_xor(MATRIX_COL10, trans.address);
-    trans.col = col0 | (col1<<1) | (col2<<2) | (col3<<3) | (col4<<4) | (col5<<5) |
-            (col6<<6) | (col7<<7) | (col8<<8) | (col9<<9) | (col10<<10);
+    if (!trans.bypass_addrmapping) {
+        trans.col = col0 | (col1<<1) | (col2<<2) | (col3<<3) | (col4<<4) | (col5<<5) |
+                (col6<<6) | (col7<<7) | (col8<<8) | (col9<<9) | (col10<<10);
+    }
     if (IS_LP6) {
         trans.addr_col = trans.col * 16 / 8;
     } else {
