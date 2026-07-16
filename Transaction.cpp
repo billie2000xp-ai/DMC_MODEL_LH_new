@@ -66,6 +66,8 @@ void Transaction::reset() {
     ap_cmd = false;
     mask_wcmd = false;
     wrap_cmd = false;
+    mergeflag = false;
+    bypass_addrmapping = false;
     pf_type = 0;
     sub_pftype = 0;
     sub_src = 0;
@@ -75,6 +77,7 @@ void Transaction::reset() {
     bl = 0;
     arb_group = 0;
     lqos_bp = false;
+    is_addr_expanded = false;
 }
 
 Transaction::Transaction(const Transaction &t) {
@@ -130,6 +133,8 @@ Transaction::Transaction(const Transaction &t) {
     ap_cmd = t.ap_cmd;
     mask_wcmd = t.mask_wcmd;
     wrap_cmd = t.wrap_cmd;
+    mergeflag = t.mergeflag;
+    bypass_addrmapping = t.bypass_addrmapping;
     pf_type = t.pf_type;
     sub_pftype = t.sub_pftype;
     sub_src = t.sub_src;
@@ -139,6 +144,7 @@ Transaction::Transaction(const Transaction &t) {
     bl = t.bl;
     arb_group = t.arb_group;
     lqos_bp = t.lqos_bp;
+    is_addr_expanded = t.is_addr_expanded;
 }
 //add for rmw
 Transaction::Transaction(const Transaction *t) {
@@ -194,6 +200,8 @@ Transaction::Transaction(const Transaction *t) {
     ap_cmd = t->ap_cmd;
     mask_wcmd = t->mask_wcmd;
     wrap_cmd = t->wrap_cmd;
+    mergeflag = t->mergeflag;
+    bypass_addrmapping = t->bypass_addrmapping;
     pf_type = t->pf_type;
     sub_pftype = t->sub_pftype;
     sub_src = t->sub_src;
@@ -203,6 +211,7 @@ Transaction::Transaction(const Transaction *t) {
     bl = t->bl;
     arb_group = t->arb_group;
     lqos_bp = t->lqos_bp;
+    is_addr_expanded = t->is_addr_expanded;
 }
 
 Transaction::Transaction(const hha_command &c) {
@@ -218,13 +227,13 @@ Transaction::Transaction(const hha_command &c) {
     improve_cnt = 0;
     pri = c.pri;
     qos = c.qos;
-    sid = 0;
-    group = 0;
-    rank = 0;
-    sc = 0;
-    bank = 0;
-    row = 0;
-    col = 0;
+    sid = c.sid;
+    group = c.group;
+    rank = c.rank;
+    sc = c.sc;
+    bank = c.bank;
+    row = c.row;
+    col = c.col;
     group_ini = 0;
     bank_ini = 0;
     row_ini = 0;
@@ -256,6 +265,8 @@ Transaction::Transaction(const hha_command &c) {
     ap_cmd = c.ap_cmd;
     mask_wcmd = c.mask_wcmd;
     wrap_cmd = c.wrap_cmd;
+    mergeflag = c.mergeflag;
+    bypass_addrmapping = c.bypass_addrmapping;
     pf_type = c.pf_type;
     sub_pftype = c.sub_pftype;
     sub_src = c.sub_src;
@@ -265,6 +276,7 @@ Transaction::Transaction(const hha_command &c) {
     bl = 0;
     arb_group = 0;
     lqos_bp = false;
+    is_addr_expanded = false;
 }
 
 ostream &operator<<(ostream &os, const Transaction &t) {
