@@ -101,11 +101,16 @@ private:
         double reqAddToDmcTime;
         double reqEnterDmcBufTime;
     };
+    std::map<uint64_t, unsigned> expected_read_beats_map;
     std::deque<TopRespPacket> top_rdata_fifo;
     std::deque<TopRespPacket> top_wresp_fifo;
     std::deque<TopRespPacket> top_rresp_fifo;
     std::deque<TopRespPacket> top_cmdresp_fifo;
-    const size_t TOP_RESP_FIFO_DEPTH = 16;
+    bool top_rdata_active;
+    uint64_t top_rdata_task;
+    unsigned top_rdata_remain;
+    
+    const size_t TOP_RESP_FIFO_DEPTH = 88;
 
     void command_check(const hha_command &c);
     void wdata_check(uint64_t task, uint8_t channel);
