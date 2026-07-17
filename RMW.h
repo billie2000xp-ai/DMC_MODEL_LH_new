@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <ostream>
 #include <cstring>
+#include <map>
 #include "Callback.h"
 #include "SimulatorObject.h"
 #include "SystemConfiguration.h"
@@ -59,7 +60,10 @@ class Rmw:public SimulatorObject {
     bool addTransaction(Transaction * trans);
     void update_cresp();
 //    bool addData(uint32_t *data, uint32_t channel, uint64_t task);
-    void addData(uint32_t *data, uint64_t task);
+    bool addData(uint32_t *data, uint64_t task);
+    bool canAcceptData(uint64_t task) const;
+    bool hasPendingWork() const;
+    bool flushWriteMergeBuffer();
 //    void RmwInitOutputFiles();
     void cmd_set_conflict(Transaction *trans);
     void cmd_release_conflict(Transaction *trans);
@@ -78,6 +82,16 @@ class Rmw:public SimulatorObject {
     std::vector<uint64_t> WdataToSend;
     std::vector<uint32_t> WdataChannel;
     std::vector<Transaction *> RmwQue;
+
+    struct WdataOrderEntry {
+        uint64_t task;
+        unsigned remaining_beats;
+        WdataOrderEntry(uint64_t task_, unsigned remaining_beats_)
+                : task(task_), remaining_beats(remaining_beats_) {}
+    };
+    std::vector<WdataOrderEntry> wdata_order_queue;
+    void track_write_command(uint64_t task, unsigned beats);
+    void check_write_data(uint64_t task);
 
 //    string rmw_log;
 //    string log_path;
@@ -134,6 +148,39 @@ class Rmw:public SimulatorObject {
     string log_path;
     unsigned rcmd_cnt;
     unsigned wcmd_cnt;
+
+    struct WriteMergeDataRemap {
+        uint64_t src_task;
+        uint64_t dst_task;
+        unsigned remaining_beats;
+        WriteMergeDataRemap(uint64_t src_task_, uint64_t dst_task_, unsigned remaining_beats_);
+    };
+
+    struct BypassedMergedWrite {
+        uint64_t first_task;
+        uint64_t merged_task;
+        unsigned first_remaining;
+        unsigned second_remaining;
+        bool dispatched;
+        BypassedMergedWrite(uint64_t first_task_, uint64_t merged_task_, unsigned first_remaining_, unsigned second_remaining_)
+                : first_task(first_task_), merged_task(merged_task_), first_remaining(first_remaining_),
+                  second_remaining(second_remaining_), dispatched(false) {}
+    };
+
+    std::vector<WriteMergeDataRemap> write_merge_data_remaps;
+    std::map<uint64_t, unsigned> pending_write_data_cnt;
+    std::map<uint64_t, unsigned> fast_bypass_write_data_cnt;
+    std::map<uint64_t, BypassedMergedWrite> bypassed_merged_writes;
+    std::map<uint64_t, uint64_t> write_merge_first_resp_task;
+
+    bool is_write_merge_candidate(const Transaction *trans) const;
+    bool can_merge_write_pair(const Transaction *first, const Transaction *second) const;
+    Transaction *build_merged_write_transaction(Transaction *first, Transaction *second, uint64_t merged_task, bool mask_wcmd);
+    bool handle_write_merge_transaction(Transaction *trans);
+    bool remap_write_merge_data(uint32_t *data, uint64_t task);
+    bool has_queued_write_data(uint64_t task) const;
+    void rebuild_conflict_state();
+    bool is_unpaired_write_merge_timeout(Transaction *trans, cmd_state *state);
 
 //    public:
 //    unsigned push_cnt;
