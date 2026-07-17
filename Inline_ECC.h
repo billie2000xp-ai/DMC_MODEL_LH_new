@@ -104,6 +104,12 @@ class Inline_ECC:public SimulatorObject {
     ECC_MODEL_STATE ecc_pre_state;
     Transaction *pdu_push_pending_trans;
     uint32_t pdu_push_pending_wr_ecc_buf_id;
+    bool iecc_owner_valid;
+    uint64_t iecc_owner_task;
+    uint64_t iecc_owner_address;
+    TransactionType iecc_owner_type;
+    bool iecc_owner_mask_wcmd;
+    bool iecc_owner_ecc_flag;
 
     unsigned iecc_cmd_cnt;
     unsigned iecc_wdata_cnt;
