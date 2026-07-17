@@ -1,3 +1,17 @@
+/* $$$!!Warning: Huawei key information asset. No spread without permission.$$$ */
+/* CODEMARK:RKeR1B8WMAfemkt1tTDGp4eOEddgxKn4NOPmdw0w+6Q3n1pxgDEX+kGBiRV20e1NKuLwOh60qWwx
+7DOUvTqsDpJdC/G6ahMCQuRlwWqc+IFZzrc5cIqPE3A7jHl/EgKyP41kTQ6BkMU/s0IoINNxkQOo
+uKOh7jSCX07p4Vl6g0QtMHLsSgDK/YSZdjgE13he4CT7U8iwigLHmIpebY80/koKjuM3Tsjs19my
+gTpJhCMisEW4M6zj2hnKbIr336sJdUlFtEwgCGRax8yNOlLlFoTSWzCI9bHgatAMTxzDXElb5GBr
+ZrrdM5ZAjEp7l/bo# */
+/* $$$!!Warning: Deleting or modifying the preceding information is prohibited.$$$ */
+/*
+* Copyright @ Huawei Technologies Co., Ltd. 2019-2029. All rights reserved.
+* Description: Inline_ECC.cpp
+* Author: l00434636
+* Create: 2020-10-27
+*/
+
 #include <stdio.h>
 #include "Inline_ECC.h"
 #include "MemoryController.h"
@@ -63,6 +77,12 @@ Inline_ECC::Inline_ECC(MemoryController *_top,unsigned id, ostream &DDRSim_log_)
     ecc_pre_state = TRY_HIT_ECC_BUF;
     pdu_push_pending_trans = NULL;
     pdu_push_pending_wr_ecc_buf_id = 0xffff;
+    iecc_owner_valid = false;
+    iecc_owner_task = 0;
+    iecc_owner_address = 0;
+    iecc_owner_type = DATA_READ;
+    iecc_owner_mask_wcmd = false;
+    iecc_owner_ecc_flag = false;
     avail_rd_ecc_buf_id = 0xffff;
     avail_wr_ecc_buf_id = 0xffff;
     pdu_addr = 0;
@@ -333,12 +353,7 @@ bool Inline_ECC::ecc_try_add_rd_trans(Transaction * trans, uint32_t rd_ecc_buf_i
     msg.pt = DMC_PATH;
     msg.num_256bit = trans->burst_length + 1;
     
-    bool ret = false;
-    if (RMW_ENABLE) {
-        ret = top->rmw->addTransaction(trans);
-    } else {
-        ret = top->addTransaction(trans);
-    }
+    bool ret = top->push_after_iecc(trans);
     if (ret) {
         top->tasks_info[trans->task].rd_finish = false;
         top->tasks_info[trans->task].wr_finish = false;
@@ -360,12 +375,7 @@ bool Inline_ECC::ecc_try_add_wr_trans(Transaction * trans, uint32_t wr_ecc_buf_i
     unsigned int n_bit=0;
     msg.pt = DMC_PATH;
     msg.num_256bit = trans->burst_length + 1;
-    bool ret = false;
-    if (RMW_ENABLE) {
-        ret = top->rmw->addTransaction(trans);
-    } else {
-        ret = top->addTransaction(trans);
-    }
+    bool ret = top->push_after_iecc(trans);
     if (ret) {
         top->tasks_info[trans->task].rd_finish = false;
         top->tasks_info[trans->task].wr_finish = false;
@@ -411,8 +421,12 @@ bool Inline_ECC::try_add_ecc_rd(Transaction * trans, uint32_t rd_ecc_buf_id) {
 //    *trans_rd_ecc = Transaction(*trans);
     trans_rd_ecc->transactionType = DATA_READ;
     trans_rd_ecc->ecc_flag = true;
+    unsigned ecc_ratio = 8; // 冗余比配置
+    unsigned req_ecc_size = trans->data_size / ecc_ratio;
+    unsigned base_ecc_size = JEDEC_DATA_BUS_BITS * 16 / 8;
     //trans_rd_ecc->burst_length = unsigned(IECC_BL32_MODE) * 2 + 1;
-    trans_rd_ecc->data_size = JEDEC_DATA_BUS_BITS*16/8;
+    // trans_rd_ecc->data_size = JEDEC_DATA_BUS_BITS*16/8;
+    trans_rd_ecc->data_size = (req_ecc_size > base_ecc_size) ? req_ecc_size : base_ecc_size;
     trans_rd_ecc->burst_length = (trans_rd_ecc->data_size)/32 - 1;
     trans_rd_ecc->task = ecc_task;
     trans_rd_ecc->inject_time = now();
@@ -426,11 +440,7 @@ bool Inline_ECC::try_add_ecc_rd(Transaction * trans, uint32_t rd_ecc_buf_id) {
 //    if (RMW_ENABLE) {
     addr_ecc_map(trans_rd_ecc);
 //    }
-    if (RMW_ENABLE) {
-        ret = top->rmw->addTransaction(trans_rd_ecc);
-    } else {
-        ret = top->addTransaction(trans_rd_ecc);
-    }
+    ret = top->push_after_iecc(trans_rd_ecc);
     if (ret) {
         top->tasks_info[trans_rd_ecc->task].rd_finish = false;
         top->tasks_info[trans_rd_ecc->task].wr_finish = false;
@@ -458,11 +468,14 @@ bool Inline_ECC::try_add_ecc_wr(Transaction * trans, uint32_t wr_ecc_buf_id) {
 //    *trans_wr_ecc = Transaction(*trans);
     trans_wr_ecc->transactionType = DATA_WRITE;
     trans_wr_ecc->ecc_flag = true;
+    unsigned ecc_ratio = 8; // 冗余比配置
+    unsigned req_ecc_size = trans->data_size / ecc_ratio;
+    unsigned base_ecc_size = JEDEC_DATA_BUS_BITS * 16 / 8;
     if(ecc_merge_flag){
-        trans_wr_ecc->data_size = JEDEC_DATA_BUS_BITS*16/8*2;
+        trans_wr_ecc->data_size = base_ecc_size*2;
     }
     else{
-        trans_wr_ecc->data_size = JEDEC_DATA_BUS_BITS*16/8;
+        trans_wr_ecc->data_size = (req_ecc_size > base_ecc_size) ? req_ecc_size : base_ecc_size;
     }
     //trans_wr_ecc->burst_length = unsigned(IECC_BL32_MODE) * 2 + 1;
     trans_wr_ecc->burst_length = (trans_wr_ecc->data_size)/32 - 1;
@@ -479,14 +492,12 @@ bool Inline_ECC::try_add_ecc_wr(Transaction * trans, uint32_t wr_ecc_buf_id) {
     }
     msg_wr_ecc.pt = DMC_PATH;
     msg_wr_ecc.num_256bit = trans_wr_ecc->burst_length + 1;
-    if(false && wr_ecc_buf[wr_ecc_buf_id].wr_ecc_pos!=0xffff){
+    if((req_ecc_size < trans_wr_ecc->data_size) && wr_ecc_buf[wr_ecc_buf_id].wr_ecc_pos!=0xffff){
         trans_wr_ecc->mask_wcmd = true;
-    }
-    if (RMW_ENABLE) {
-        ret = top->rmw->addTransaction(trans_wr_ecc);
     } else {
-        ret = top->addTransaction(trans_wr_ecc);
+        trans_wr_ecc->mask_wcmd = false;
     }
+    ret = top->push_after_iecc(trans_wr_ecc);
     if (ret) {
         top->tasks_info[trans_wr_ecc->task].rd_finish = false;
         top->tasks_info[trans_wr_ecc->task].wr_finish = false;
@@ -917,7 +928,30 @@ bool Inline_ECC::addTransaction(Transaction * trans) {
         }
         return false;
     }
-    return (proc_iecc(trans, now())); // Delete
+
+    if (iecc_owner_valid
+            && (iecc_owner_task != trans->task
+                || iecc_owner_address != trans->address
+                || iecc_owner_type != trans->transactionType
+                || iecc_owner_mask_wcmd != trans->mask_wcmd
+                || iecc_owner_ecc_flag != trans->ecc_flag)) {
+        return false;
+    }
+
+    if (!iecc_owner_valid) {
+        iecc_owner_valid = true;
+        iecc_owner_task = trans->task;
+        iecc_owner_address = trans->address;
+        iecc_owner_type = trans->transactionType;
+        iecc_owner_mask_wcmd = trans->mask_wcmd;
+        iecc_owner_ecc_flag = trans->ecc_flag;
+    }
+
+    bool ret = proc_iecc(trans, now());
+    if (ret) {
+        iecc_owner_valid = false;
+    }
+    return ret;
 
     if (WRITE_BUFFER_ENABLE) {
         if (top->wb->full()) return false;
@@ -957,6 +991,9 @@ void Inline_ECC::update() {
 
 // normal command and ecc command use the same column
 void Inline_ECC::addr_exp(Transaction * trans) {
+    if (WCMD_MERGE_EN && trans->is_addr_expanded) {
+        return;
+    }
     //unsigned capacity_ratio = 960;
     unsigned capacity_ratio = IECC_CAP_RATIO;
     unsigned col_per_row = 1024;
@@ -972,6 +1009,23 @@ void Inline_ECC::addr_exp(Transaction * trans) {
     trans->bank = trans->bankIndex % banks_per_bg;
     trans->col = (col_per_row * (row * bank_per_rank + bank) + col) % capacity_ratio;
     trans->bankIndex = trans->bankIndex + trans->rank * NUM_BANKS;
+    // uint32_t col_9_0 = trans->col & 0x3FF;
+    // if (col_9_0 >= 896) {
+    //     // 暂存原始 row 和 col
+    //     uint32_t orig_row = trans->row;
+    //     uint32_t orig_col = trans->col;
+
+    //     // 提取 col[6:4]，先右移 4 位，再用 0x7 (111) 掩码
+    //     uint32_t col_6_4 = (orig_col >> 4) & 0x7;
+
+    //     // Bank 保持不变 
+
+    //     // Row 重映射
+    //     trans->row = 57344 + (orig_row / 7);
+
+    //     // Col 重映射
+    //     trans->col = (col_6_4 * 16) + ((orig_row % 7) * 128);
+    // }
     if (IS_LP6) {
         trans->addr_col = trans->col * 16 / 8;
         trans->addr_col_ini = trans->col_ini * 16 / 8;
@@ -980,10 +1034,11 @@ void Inline_ECC::addr_exp(Transaction * trans) {
         trans->addr_col_ini = trans->col_ini * JEDEC_DATA_BUS_BITS / 8;
     }
     if (DEBUG_BUS) {
-        PRINTN(setw(10)<<now()<<" -- ADD_EXP :: task="<<trans->task<<", rank="<<trans->rank<<", row="<<row<<", bank="
-                <<bank<<", col="<<col<<", addr_col="<<trans->addr_col_ini<<", exp_row="<<trans->row<<", exp_bank="<<trans->bankIndex
+        PRINTN(setw(10)<<now()<<" -- ADD_EXP :: addr=0x"<<hex<<trans->address<<dec<<", task="<<trans->task<<", rank="<<trans->rank<<", row="<<row<<", bankIndex="
+                <<bank<<", col="<<col<<", addr_col="<<trans->addr_col_ini<<", exp_row="<<trans->row<<", exp_bankIndex="<<trans->bankIndex
                 <<", exp_col="<<trans->col<<", exp_addr_col="<<trans->addr_col<<endl);
     }
+    trans->is_addr_expanded = true;
 }
 
 
@@ -993,10 +1048,12 @@ void Inline_ECC::addr_ecc_map(Transaction * trans) {
     unsigned capacity_ratio = IECC_CAP_RATIO;
 //    unsigned col_per_row = 1024;
     unsigned byte_per_col = 2;
-    unsigned ecc_data_size = 32;
+    unsigned ecc_ratio = 8;
+    unsigned ecc_data_size = 256 / ecc_ratio;
+    // unsigned ecc_data_size = 32;
     unsigned col = trans->col;
     trans->col_ini = col;
-    trans->col = capacity_ratio + (col/256)* ecc_data_size/byte_per_col;
+    trans->col = capacity_ratio + (col/128)* ecc_data_size/byte_per_col;
     if (IS_LP6) {
         trans->addr_col = trans->col * 16 / 8;
         trans->addr_col_ini = trans->col_ini * 16 / 8;
