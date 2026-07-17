@@ -19,6 +19,7 @@ gCsQ5S8dHISlBFtDwNvcQ3yROkU5soXPnjDcr9UgAbT0+Kzk6UeRneIqMID/n+nQ8uUQOxnPDZfC
 #include <assert.h>
 #include <iomanip>
 #include <algorithm>
+#include <sstream>
 using namespace std;
 
 namespace LPDDRSim {
@@ -270,9 +271,16 @@ bool Rmw::handle_write_merge_transaction(Transaction *trans) {
                     first_beats - first->data_ready_cnt));
         }
         write_merge_first_resp_task[second_task] = first_task;
+        if (RMW_CMD_MODE == 1 && top->parentMemorySystem) {
+            auto first_map = top->parentMemorySystem->write_map.find(first_task);
+            if (first_map != top->parentMemorySystem->write_map.end()) {
+                top->parentMemorySystem->write_map.erase(first_map);
+            }
+        }
+        *trans = *merged;
+        delete merged;
         delete first;
-        delete trans;
-        RmwQue[i] = merged;
+        RmwQue[i] = trans;
         RmwCmdState[i]->task = second_task;
         RmwCmdState[i]->rmwTimeAdded = now();
         RmwCmdState[i]->rmwState = QUE_WAITING;
@@ -318,6 +326,20 @@ void Rmw::rebuild_conflict_state() {
 }
 
 bool Rmw::remap_write_merge_data(uint32_t *data, uint64_t task) {
+    // #region debug-point H5:rmw-data-ownership
+    if (task == 1132) {
+        std::ostringstream dbg_payload;
+        dbg_payload << "{\"sessionId\":\"trace-l06-timeout\",\"runId\":\"pre-fix\",\"hypothesisId\":\"H5\",\"location\":\"Rmw::remap_write_merge_data\",\"msg\":\"[DEBUG] task data ownership lookup\",\"data\":{\"now\":" << now() << ",\"task\":" << task << ",\"bypassedMergedWrites\":" << bypassed_merged_writes.size() << ",\"remaps\":" << write_merge_data_remaps.size() << ",\"pendingData\":" << pending_write_data_cnt.size() << ",\"queuedData\":" << WdataToSend.size() << "}}";
+        std::string dbg_json = dbg_payload.str();
+        size_t dbg_quote = 0;
+        while ((dbg_quote = dbg_json.find('"', dbg_quote)) != std::string::npos) {
+            dbg_json.insert(dbg_quote, 1, '\\');
+            dbg_quote += 2;
+        }
+        std::string dbg_command = "curl.exe -s -X POST http://127.0.0.1:7778/event -H \"Content-Type: application/json\" -d \"" + dbg_json + "\" > NUL";
+        std::system(dbg_command.c_str());
+    }
+    // #endregion
     for (auto it = bypassed_merged_writes.begin(); it != bypassed_merged_writes.end(); ++it) {
         BypassedMergedWrite &entry = it->second;
         bool first_source = task == entry.first_task && entry.first_remaining != 0;
@@ -345,6 +367,20 @@ bool Rmw::remap_write_merge_data(uint32_t *data, uint64_t task) {
     for (size_t i = 0; i < write_merge_data_remaps.size(); i++) {
         if (write_merge_data_remaps[i].src_task != task) continue;
         uint64_t dst_task = write_merge_data_remaps[i].dst_task;
+        if (RMW_CMD_MODE == 1) {
+            for (auto rmwq : RmwQue) {
+                if (rmwq->task != dst_task || rmwq->transactionType != DATA_WRITE
+                        || rmwq->data_ready_cnt > rmwq->burst_length) continue;
+                rmwq->data_ready_cnt++;
+                write_merge_data_remaps[i].remaining_beats--;
+                if (write_merge_data_remaps[i].remaining_beats == 0) {
+                    write_merge_data_remaps.erase(write_merge_data_remaps.begin() + i);
+                }
+                pre_req_data_time = now();
+                return true;
+            }
+            return false;
+        }
         if (!top->parentMemorySystem->submitData(data, dst_task, false)) return false;
         check_write_data(dst_task);
         write_merge_data_remaps[i].remaining_beats--;
@@ -367,6 +403,20 @@ bool Rmw::is_unpaired_write_merge_timeout(Transaction *trans, cmd_state *state) 
 }
 
 bool Rmw::addData(uint32_t *data, uint64_t task) {
+    // #region debug-point H5:rmw-add-data
+    if (task == 1132) {
+        std::ostringstream dbg_payload;
+        dbg_payload << "{\"sessionId\":\"trace-l06-timeout\",\"runId\":\"pre-fix\",\"hypothesisId\":\"H5\",\"location\":\"Rmw::addData\",\"msg\":\"[DEBUG] task data add\",\"data\":{\"now\":" << now() << ",\"task\":" << task << ",\"rmwQueue\":" << RmwQue.size() << ",\"queuedData\":" << WdataToSend.size() << ",\"writeMap\":" << top->parentMemorySystem->write_map.size() << "}}";
+        std::string dbg_json = dbg_payload.str();
+        size_t dbg_quote = 0;
+        while ((dbg_quote = dbg_json.find('"', dbg_quote)) != std::string::npos) {
+            dbg_json.insert(dbg_quote, 1, '\\');
+            dbg_quote += 2;
+        }
+        std::string dbg_command = "curl.exe -s -X POST http://127.0.0.1:7778/event -H \"Content-Type: application/json\" -d \"" + dbg_json + "\" > NUL";
+        std::system(dbg_command.c_str());
+    }
+    // #endregion
     if (remap_write_merge_data(data, task)) return true;
     auto fast_bypass = fast_bypass_write_data_cnt.find(task);
     if (fast_bypass != fast_bypass_write_data_cnt.end()) {
@@ -434,7 +484,15 @@ bool Rmw::canAcceptData(uint64_t task) const {
         }
     }
     for (const auto &entry : write_merge_data_remaps) {
-        if (entry.src_task == task) return top->canReceiveWdata(entry.dst_task);
+        if (entry.src_task != task) continue;
+        if (RMW_CMD_MODE == 1) {
+            for (auto rmwq : RmwQue) {
+                if (rmwq->task == entry.dst_task && rmwq->transactionType == DATA_WRITE
+                        && rmwq->data_ready_cnt <= rmwq->burst_length) return true;
+            }
+            return false;
+        }
+        return top->canReceiveWdata(entry.dst_task);
     }
     for (auto rmwq : RmwQue) {
         if (rmwq->task == task && rmwq->transactionType == DATA_WRITE
@@ -743,6 +801,20 @@ void Rmw::sch_que() {
 void Rmw::arb_node() {
     if (RmwQue.empty()) return;
 
+    if (top->iecc->iecc_owner_valid) {
+        bool owner_in_queue = false;
+        for (auto queued : RmwQue) {
+            if (queued->task == top->iecc->iecc_owner_task) {
+                owner_in_queue = true;
+                break;
+            }
+        }
+        if (!owner_in_queue && top->iecc->pdu_push_pending_trans == NULL) {
+            top->iecc->iecc_owner_valid = false;
+            top->iecc->ecc_model_state = TRY_HIT_ECC_BUF;
+        }
+    }
+
     unsigned size = RmwQue.size();
     for (unsigned i = 0; i < size; i++) {
         if ((RmwQue[i]->transactionType == DATA_READ) && (RmwCmdState[i]->rmwState!=QUE_WAITING)){
@@ -755,7 +827,12 @@ void Rmw::arb_node() {
         if (now() < RmwQue[i]->arb_time) { 
             continue;
         }
-        if (RmwConfCnt[i]->ad_conf_cnt != 0) {
+        bool iecc_owned = top->iecc->iecc_owner_valid
+                && RmwQue[i]->task == top->iecc->iecc_owner_task;
+        if (top->iecc->iecc_owner_valid && !iecc_owned) {
+            continue;
+        }
+        if (RmwConfCnt[i]->ad_conf_cnt != 0 && !iecc_owned) {
             continue;
         }
         if ((RmwCmdState[i]-> rmwState == MERGE_READ)&&(RmwQue[i]->mask_wcmd==true)) {
@@ -814,6 +891,12 @@ void Rmw::arb_node() {
                         WdataChannel.push_back(ch);
                     }
                 }
+                if (merged_command) {
+                    uint64_t task = RmwQue[i]->task;
+                    top->parentMemorySystem->markMergedWrite(
+                            task, write_merge_first_resp_task[task]);
+                    write_merge_first_resp_task.erase(task);
+                }
 
                 //update statistic info
                 if (RmwQue[i]->transactionType == DATA_READ) {
@@ -824,12 +907,12 @@ void Rmw::arb_node() {
                 rmw_cmd_cnt --;
 
                 //delete all states related to sended cmd this round
-                cmd_release_conflict(RmwQue[i]);
                 delete RmwConfCnt[i];
                 RmwConfCnt.erase(RmwConfCnt.begin() + i);
                 delete RmwCmdState[i];
                 RmwCmdState.erase(RmwCmdState.begin() + i);
                 RmwQue.erase(RmwQue.begin() + i);
+                rebuild_conflict_state();
                 break;
             }
         } else if ((RmwQue[i]->transactionType == DATA_WRITE)&&(RmwQue[i]->mask_wcmd==false)
@@ -873,12 +956,12 @@ void Rmw::arb_node() {
                 rmw_cmd_cnt --;
 
                 //delete all states related to sended cmd this round
-                cmd_release_conflict(RmwQue[i]);
                 delete RmwConfCnt[i];
                 RmwConfCnt.erase(RmwConfCnt.begin() + i);
                 delete RmwCmdState[i];
                 RmwCmdState.erase(RmwCmdState.begin() + i);
                 RmwQue.erase(RmwQue.begin() + i);
+                rebuild_conflict_state();
                 break;
             }
         } else {
