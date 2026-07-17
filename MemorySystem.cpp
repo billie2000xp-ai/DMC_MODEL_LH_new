@@ -229,6 +229,8 @@ MemorySystem::MemorySystem(unsigned dmcId,unsigned hhaId, ostream &DDRSim_log_,s
             pre_pbr_cnt.push_back(0);
         }
     }
+    backend_locked = false;
+    locked_task = 0;
 }
 
 //==============================================================================
@@ -343,21 +345,49 @@ void MemorySystem::noc_read_inform(bool fast_wakeup_rank0, bool fast_wakeup_rank
 }
 //==============================================================================
 bool MemorySystem::submitTransaction(Transaction *trans) {
+    // ================= 1. 严格防穿插锁 (认 ID + 认合并) =================
+    bool is_legitimate_retry = (trans->task == locked_task);
+    if (!is_legitimate_retry && WCMD_MERGE_EN && trans->transactionType == DATA_WRITE) {
+        for (size_t i = 0; i < write_merge_buffer.size(); i++) {
+            WriteMergeEntry &entry = write_merge_buffer[i];
+            if (entry.paired_tail || entry.first_trans == NULL) continue;
+            bool entry_has_locked = (entry.first_trans->task == locked_task)
+                    || (entry.has_second && entry.second_trans != NULL && entry.second_trans->task == locked_task)
+                    || (entry.task_allocated && entry.merged_task == locked_task);
+            bool entry_has_current = (entry.first_trans->task == trans->task)
+                    || (entry.has_second && entry.second_trans != NULL && entry.second_trans->task == trans->task)
+                    || (entry.task_allocated && entry.merged_task == trans->task);
+            if (entry_has_locked && entry_has_current) {
+                is_legitimate_retry = true;
+                break;
+            }
+        }
+    }
+
+    // 如果大门锁着，且不是合法重试，且不是 IECC 内部伴生包，拦截
+    if (backend_locked && !is_legitimate_retry && !trans->ecc_flag) {
+        if (DEBUG_BUS) {
+            PRINTN(setw(10)<<now()<<" -- STRICT_LOCK :: block task="<<trans->task
+                    <<", waiting for task="<<locked_task<<" or its merged version."<<endl);
+        }
+        return false;
+    }
+    // ========================================================================
+
     if (memoryController->pre_req_time == memoryController->now() 
             || (WRITE_BUFFER_ENABLE && memoryController->wb->pre_req_time == memoryController->wb->now()) 
             || (RMW_ENABLE && memoryController->rmw->pre_req_time == memoryController->rmw->now())) {
         return false;
     }
+    
     bool ret = false;
-//    Transaction *trans = new Transaction(command);
     trans_init(trans, now());
+    bool needs_write_data = trans->transactionType != DATA_READ
+            && trans->data_ready_cnt <= trans->burst_length;
 
     write_msg msg;
     msg.pt = DMC_PATH;
     msg.num_256bit = trans->burst_length + 1;
-
-//    addressMapping(*trans);
-//    trans_check(trans);
 
     if (tPIPE_PRE_DMC == 0) {
         ret = memoryController->push_req(trans);
@@ -370,6 +400,18 @@ bool MemorySystem::submitTransaction(Transaction *trans) {
             ret = true;
         }
     }
+
+    // ================= 2. 根据结果更新锁 =================
+    if (!trans->ecc_flag) { // 不让底层自己生成的伴生命令去改变外部大门的锁
+        if (ret) {
+            backend_locked = false; // 成功下发，IECC 空闲
+        } else {
+            backend_locked = true;  // 被拒，死锁此任务
+            locked_task = trans->task;
+        }
+    }
+    // =======================================================
+    
     if (ret) {
         access_cnt ++;
         total_access_cnt ++;
@@ -378,14 +420,14 @@ bool MemorySystem::submitTransaction(Transaction *trans) {
                     <<" mask="<<trans->mask_wcmd<<" ecc="<<trans->ecc_flag<<" burst="<<trans->burst_length
                     <<" addr=0x"<<hex<<trans->address<<dec<<" write_map_size="<<write_map.size()<<endl);
         }
-        if (trans->transactionType != DATA_READ && trans->data_ready_cnt <= trans->burst_length) {
+        if (needs_write_data) {
             write_map[trans->task] = msg;
         }
     } else {
-        //delete trans;
         bp_cnt ++;
         total_bp_cnt ++;
     }
+
     task_cnt ++;
     total_task_cnt ++;
 
@@ -452,12 +494,8 @@ bool MemorySystem::submitTransaction(Transaction *trans) {
 }
 
 bool MemorySystem::is_write_merge_candidate(const Transaction *trans) const {
-    if (trans == NULL) return false;
-    if (!WCMD_MERGE_EN) return false;
-    if (trans->transactionType != DATA_WRITE) return false;
-    if (trans->mask_wcmd) return false;
-    if (trans->ecc_flag) return false;
-    return ((trans->burst_length + 1) * DMC_DATA_BUS_BITS / 8) == 128;
+    (void)trans;
+    return false;
 }
 
 bool MemorySystem::can_merge_write_pair(const Transaction *first, const Transaction *second) const {
@@ -530,6 +568,7 @@ bool MemorySystem::dispatch_write_merge_entry(size_t index, bool force_mask_wcmd
     }
 
     if (entry.has_second) {
+        merged_write_tasks[dispatch_task] = entry.first_trans->task;
         if (entry.first_data_ready_cnt > 0) pending_write_merge_datas.push_back(PendingWriteMergeData(dispatch_task, entry.first_data_ready_cnt));
         if (entry.second_data_ready_cnt > 0) pending_write_merge_datas.push_back(PendingWriteMergeData(dispatch_task, entry.second_data_ready_cnt));
         if (entry.first_trans->task != dispatch_task && entry.first_data_ready_cnt < first_beats) {
@@ -537,11 +576,6 @@ bool MemorySystem::dispatch_write_merge_entry(size_t index, bool force_mask_wcmd
         }
         if (entry.second_trans->task != dispatch_task && entry.second_data_ready_cnt < second_beats) {
             write_merge_data_remaps.push_back(WriteMergeDataRemap(entry.second_trans->task, dispatch_task, second_beats - entry.second_data_ready_cnt));
-        }
-        if (entry.first_data_ready_cnt < first_beats) {
-            pending_write_merge_resps.push_back(PendingWriteMergeResp(entry.first_trans->task, entry.upstream_channel, entry.first_trans->task));
-        } else if (!write_merge_response(entry.first_trans->task, entry.upstream_channel)) {
-            pending_write_merge_resps.push_back(PendingWriteMergeResp(entry.first_trans->task, entry.upstream_channel));
         }
         totalWriteMergePair++;
         if (DEBUG_BUS) {
@@ -584,18 +618,33 @@ bool MemorySystem::pump_write_merge_buffer() {
     if (!write_merge_buffer.empty() && write_merge_buffer[0].paired_tail) {
         write_merge_buffer.erase(write_merge_buffer.begin());
     }
+    
+    // ================= 联动改进 1 =================
+    // 因为现在配对成功的条目不一定在 buffer 头部，必须遍历寻找配对好的条目优先发走
     for (size_t i = 0; i < write_merge_buffer.size(); i++) {
         if (write_merge_buffer[i].has_second) {
-            return dispatch_write_merge_entry(i, false);
+            if(dispatch_write_merge_entry(i, false)) {
+                return true;
+            }
+            // return dispatch_write_merge_entry(i, false);
         }
     }
-    return false;
-}
-
-bool MemorySystem::has_paired_write_merge_entry() const {
-    for (size_t i = 0; i < write_merge_buffer.size(); i++) {
-        if (write_merge_buffer[i].has_second) return true;
+    
+    // ================= 改进点 2 =================
+    // 头项下发逻辑：不仅需要 data ready，还必须满足至少等待了 buffer depth 的时间窗口
+    if (!write_merge_buffer.empty() && write_merge_buffer[0].first_trans != NULL) {
+        
+        bool is_data_ready = (write_merge_buffer[0].first_data_ready_cnt > write_merge_buffer[0].first_trans->burst_length);
+        
+        // 强制驻留时间检查：当前时间 - 入队时间 >= 深度约束
+        bool wait_enough_time = (now() - write_merge_buffer[0].enqueue_time) >= WRITE_MERGE_TIMEOUT;
+        
+        if (is_data_ready && wait_enough_time) {
+            return dispatch_write_merge_entry(0, UNPAIRED_TO_RMW_EN);
+        }
     }
+    // ============================================
+    
     return false;
 }
 
@@ -625,7 +674,9 @@ bool MemorySystem::hasPendingWork() const {
 
 bool MemorySystem::handle_write_merge_transaction(Transaction *trans) {
     pump_write_merge_buffer();
-    if (has_paired_write_merge_entry()) return false;
+    
+    // ================= 改进点 1 =================
+    // 遍历整个 buffer 寻找可以 pair 的条目，不再只匹配 tail
     for (size_t i = 0; i < write_merge_buffer.size(); i++) {
         WriteMergeEntry &entry = write_merge_buffer[i];
         if (!entry.has_second && !entry.paired_tail && can_merge_write_pair(entry.first_trans, trans)) {
@@ -637,10 +688,12 @@ bool MemorySystem::handle_write_merge_transaction(Transaction *trans) {
                         <<" second_task="<<trans->task<<" first_addr=0x"<<hex<<entry.first_trans->address
                         <<" second_addr=0x"<<trans->address<<dec<<" used="<<write_merge_buffer.size()<<endl);
             }
-            dispatch_write_merge_entry(i, false);
+            pump_write_merge_buffer(); // 配对成功后，立即调用 pump 将其发走
             return true;
         }
     }
+    // ============================================
+
     if (write_merge_buffer.size() >= WRITE_MERGE_BUFFER_DEPTH) {
         totalWriteMergeBufferFull++;
         if (DEBUG_BUS) {
@@ -712,6 +765,18 @@ bool MemorySystem::write_merge_response(uint64_t task, uint8_t resp_channel) {
     return (*WriteResp)(resp_channel, task, 0, 0, 0);
 }
 
+bool MemorySystem::takeMergedWrite(uint64_t task, uint64_t &first_task) {
+    auto merged = merged_write_tasks.find(task);
+    if (merged == merged_write_tasks.end()) return false;
+    first_task = merged->second;
+    merged_write_tasks.erase(merged);
+    return true;
+}
+
+void MemorySystem::markMergedWrite(uint64_t task, uint64_t first_task) {
+    merged_write_tasks[task] = first_task;
+}
+
 void MemorySystem::update_write_merge_resp() {
     if (pending_write_merge_resps.empty()) return;
     if (pre_write_merge_resp_time == now()) return;
@@ -746,14 +811,6 @@ bool MemorySystem::addWriteDataPending(uint64_t task, unsigned remaining_beats, 
 }
 
 bool MemorySystem::addTransaction(Transaction *trans) {
-    if (is_write_merge_candidate(trans)) {
-        return handle_write_merge_transaction(trans);
-    }
-    if (has_paired_write_merge_entry()) {
-        pump_write_merge_buffer();
-        return false;
-    }
-    pump_write_merge_buffer();
     return submitTransaction(trans);
 }
 //==============================================================================
@@ -764,6 +821,21 @@ uint32_t MemorySystem::GetTransactionLen() {
 //    below interface for dmc write data
 //==============================================================================
 bool MemorySystem::addData(uint32_t *data ,uint64_t taskId, bool ecc_flag) {
+    if (RMW_ENABLE || WCMD_MERGE_EN) {
+        return memoryController->rmw->addData(data, taskId);
+    }
+    return submitData(data, taskId, ecc_flag);
+}
+
+bool MemorySystem::canAcceptData(uint64_t taskId) const {
+    if (RMW_ENABLE || WCMD_MERGE_EN) {
+        return memoryController->rmw->canAcceptData(taskId);
+    }
+    return memoryController->canReceiveWdata(taskId);
+}
+
+bool MemorySystem::submitData(uint32_t *data, uint64_t taskId, bool ecc_flag) {
+    if (!memoryController->canReceiveWdata(taskId)) return false;
     if (!ecc_flag && remap_write_merge_data(data, taskId)) {
         return true;
     }
@@ -785,56 +857,56 @@ bool MemorySystem::addData(uint32_t *data ,uint64_t taskId, bool ecc_flag) {
             return false;
         }
     } else {    
-        if (!trans_fifo_full && TRANS_FIFO_DEPTH!=0) {
-            if (DEBUG_BUS) {
-                PRINTN(setw(10)<<now()<<" -- TRANS FIFO is NOT FULL :: task="<<taskId<<" data_cnt="
-                        <<trans_fifo_data_cnt<<" last_wdata_time="<<memoryController->pre_req_data_time<<endl);
-            }
+        // if (!trans_fifo_full && TRANS_FIFO_DEPTH!=0) {
+        //     if (DEBUG_BUS) {
+        //         PRINTN(setw(10)<<now()<<" -- TRANS FIFO is NOT FULL :: task="<<taskId<<" data_cnt="
+        //                 <<trans_fifo_data_cnt<<" last_wdata_time="<<memoryController->pre_req_data_time<<endl);
+        //     }
             
-            // one cycle one data check
-            if (memoryController->pre_req_data_time == memoryController->now() || (RMW_ENABLE && memoryController->rmw->pre_req_data_time == memoryController->rmw->now()) ) {
-                return false;
-            }
-            if (RMW_ENABLE) {
-                unsigned size = memoryController->rmw->RmwQue.size(); 
-                for (unsigned i =0; i < size; i++) {
-                    if ((taskId==memoryController->rmw->RmwQue[i]->task)&&(memoryController->rmw->RmwQue[i]->transactionType==DATA_WRITE)
-                         &&(!memoryController->rmw->RmwQue[i]->mask_wcmd)&&(RMW_CMD_MODE==0)&&(!memoryController->rmw->RmwQue[i]->ecc_flag)) {
-                        if (DEBUG_BUS) {
-                            PRINTN(setw(10)<<now()<<" -- WDATA :: RMW BP Wdata, FULL Wcmd must be send first to DMC under fast cmd mode, task="<<taskId<<endl);
-                        }
-                        return false; 
-                    }
-                }
-            } 
-            if ((memoryController->pre_req_data_time + 1) == memoryController->now()) { // sequential wdata
-                if (DEBUG_BUS) {
-                    PRINTN(setw(10)<<now()<<" -- SEQ WDATA TO TRANS UNDER NOT FULL :: task="<<taskId<<" last_wdata_time="<<memoryController->pre_req_data_time<<endl);
-                }
-                trans_fifo_data_cnt ++;
-                if (trans_fifo_data_cnt == TRANS_FIFO_DEPTH) {
-                    trans_fifo_full = true;
-                    if (DEBUG_BUS) {
-                        PRINTN(setw(10)<<now()<<" -- TRANS FIFO CHANGE TO FULL :: task="<<taskId<<" data_cnt="
-                                <<trans_fifo_data_cnt<<" last_wdata_time="<<memoryController->pre_req_data_time<<endl);
-                    }
-                }
-            }
-        } else {
-            if (DEBUG_BUS) {
-                PRINTN(setw(10)<<now()<<" -- TRANS FIFO is FULL :: task="<<taskId<<" data_cnt="
-                        <<trans_fifo_data_cnt<<" last_wdata_time="<<memoryController->pre_req_data_time<<endl);
-            }
-
-            if (memoryController->pre_req_data_time == memoryController->now()
-                    || (JEDEC_DATA_BUS_BITS != 32 && ((memoryController->pre_req_data_time + 1) == memoryController->now()))) {
-                if (DEBUG_BUS) {
-                    PRINTN(setw(10)<<now()<<" -- WDATA :: BP Wdata, one data two cyle under full trans fifo :: task="<<taskId
-                                <<" last_wdata_time="<<memoryController->pre_req_data_time<<endl);
-                }
-                return false;
-            }
+        // one cycle one data check
+        if (memoryController->pre_req_data_time == memoryController->now() || (RMW_ENABLE && memoryController->rmw->pre_req_data_time == memoryController->rmw->now()) ) {
+            return false;
         }
+        if (RMW_ENABLE) {
+            unsigned size = memoryController->rmw->RmwQue.size(); 
+            for (unsigned i =0; i < size; i++) {
+                if ((taskId==memoryController->rmw->RmwQue[i]->task)&&(memoryController->rmw->RmwQue[i]->transactionType==DATA_WRITE)
+                        &&(!memoryController->rmw->RmwQue[i]->mask_wcmd)&&(RMW_CMD_MODE==0)&&(!memoryController->rmw->RmwQue[i]->ecc_flag)) {
+                    if (DEBUG_BUS) {
+                        PRINTN(setw(10)<<now()<<" -- WDATA :: RMW BP Wdata, FULL Wcmd must be send first to DMC under fast cmd mode, task="<<taskId<<endl);
+                    }
+                    return false; 
+                }
+            }
+        } 
+        //     if ((memoryController->pre_req_data_time + 1) == memoryController->now()) { // sequential wdata
+        //         if (DEBUG_BUS) {
+        //             PRINTN(setw(10)<<now()<<" -- SEQ WDATA TO TRANS UNDER NOT FULL :: task="<<taskId<<" last_wdata_time="<<memoryController->pre_req_data_time<<endl);
+        //         }
+        //         trans_fifo_data_cnt ++;
+        //         if (trans_fifo_data_cnt == TRANS_FIFO_DEPTH) {
+        //             trans_fifo_full = true;
+        //             if (DEBUG_BUS) {
+        //                 PRINTN(setw(10)<<now()<<" -- TRANS FIFO CHANGE TO FULL :: task="<<taskId<<" data_cnt="
+        //                         <<trans_fifo_data_cnt<<" last_wdata_time="<<memoryController->pre_req_data_time<<endl);
+        //             }
+        //         }
+        //     }
+        // } else {
+        //     if (DEBUG_BUS) {
+        //         PRINTN(setw(10)<<now()<<" -- TRANS FIFO is FULL :: task="<<taskId<<" data_cnt="
+        //                 <<trans_fifo_data_cnt<<" last_wdata_time="<<memoryController->pre_req_data_time<<endl);
+        //     }
+
+        //     // two cycle one data when trans fifo full
+        //     if (memoryController->pre_req_data_time == memoryController->now() || ((memoryController->pre_req_data_time + 1) == memoryController->now())) {
+        //         if (DEBUG_BUS) {
+        //             PRINTN(setw(10)<<now()<<" -- WDATA :: BP Wdata, one data two cyle under full trans fifo :: task="<<taskId
+        //                         <<" last_wdata_time="<<memoryController->pre_req_data_time<<endl);
+        //         }
+        //         return false;
+        //     }
+        // }
     }
     
     if (DROP_WRITE_CMD || PERFECT_DMC_EN) return true;
@@ -855,8 +927,6 @@ bool MemorySystem::addData(uint32_t *data ,uint64_t taskId, bool ecc_flag) {
 
     if (WRITE_BUFFER_ENABLE) {
         memoryController->wb->addData(data ,taskId);
-    } else if (RMW_ENABLE) {
-        memoryController->rmw->addData(data ,taskId);
     } else {
         memoryController->receiveFromCPU(data ,taskId);
     }
@@ -913,25 +983,25 @@ void MemorySystem::update() {
         (*ranks).at(i)->update();
     }
 
+    if (RMW_ENABLE || WCMD_MERGE_EN) {
+        memoryController->rmw->update();
+    }
     if (IECC_ENABLE) {
         memoryController->iecc->update();
     }
     if (WRITE_BUFFER_ENABLE) {
         memoryController->wb->update();
     }
-    if (RMW_ENABLE) {
-        memoryController->rmw->update();
-    }
     memoryController->update();
 
+    if (RMW_ENABLE || WCMD_MERGE_EN) {
+        memoryController->rmw->step();
+    }
     if (IECC_ENABLE) {
         memoryController->iecc->step();
     }
     if (WRITE_BUFFER_ENABLE) {
         memoryController->wb->step();
-    }
-    if (RMW_ENABLE) {
-        memoryController->rmw->step();
     }
     memoryController->step();
 
@@ -949,6 +1019,8 @@ void MemorySystem::update() {
             register_write(0,0);
         }
     }
+    check_cnt();
+    
     if (FLOW_STAT_TIME != 0) {
         if ((now() % FLOW_STAT_TIME) == 0) {
             float total_bw = flowStatistic();
@@ -1312,7 +1384,6 @@ void MemorySystem::statistics() {
         asrefx_cnt += memoryController->AsrefExitCnt[rank];
         srpdx_cnt += memoryController->SrpdExitCnt[rank];
     }
-
     if (POWER_EN) {
         STATE_PRINTN("-------------------- Power Event And Power Consumption --------------------------------\n");
         for (size_t que = 1; que <= TRANS_QUEUE_DEPTH; que ++) {
@@ -1665,11 +1736,28 @@ void MemorySystem::statistics() {
     }
 
     STATE_PRINTN("-------------------- Request Statistics (DDR Command Number) --------------------------\n");
-    uint64_t cas64_cnt = memoryController->TotalDmcRd32B + memoryController->TotalDmcWr32B +
-            memoryController->TotalDmcRd64B + memoryController->TotalDmcWr64B +
+    uint64_t total_cas_cnt = 0;
+
+    // 判断位宽，动态调整统计粒度
+    if (JEDEC_DATA_BUS_BITS == 16) {
+        // 以 32B (1 CAS) 为粒度统计
+        total_cas_cnt = 
+            (memoryController->TotalDmcRd32B + memoryController->TotalDmcWr32B) * 1 +
+            (memoryController->TotalDmcRd64B + memoryController->TotalDmcWr64B) * 2 +
+            (memoryController->TotalDmcRd128B + memoryController->TotalDmcWr128B) * 4 +
+            (memoryController->TotalDmcRd256B + memoryController->TotalDmcWr256B) * 8;
+    } else {
+        // 默认以 64B (1 CAS) 为粒度统计 (即 JEDEC_DATA_BUS_BITS == 32)
+        // 注意：32B 请求依然占用 1 个完整的 CAS 命令 (Burst 长度固定)
+        total_cas_cnt = 
+            (memoryController->TotalDmcRd32B + memoryController->TotalDmcWr32B) * 1 +
+            (memoryController->TotalDmcRd64B + memoryController->TotalDmcWr64B) * 1 +
             (memoryController->TotalDmcRd128B + memoryController->TotalDmcWr128B) * 2 +
             (memoryController->TotalDmcRd256B + memoryController->TotalDmcWr256B) * 4;
-    row_hit_cnt = (cas64_cnt > act_cnt) ? (cas64_cnt - act_cnt) : 0;
+    }
+
+    // Hit 统计逻辑：(总读写命令数) 减去 (激活命令数) 剩下的就是命中的命令数
+    row_hit_cnt = (total_cas_cnt > act_cnt) ? (total_cas_cnt - act_cnt) : 0;
     row_miss_cnt = act_cnt;
 
     STATE_PRINTN(setw(36)<<"Active cnt"<<" : "<<setw(12)<<act_cnt - pre_act_cnt);
