@@ -23,11 +23,20 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
 #endif
     read_cb = NULL;
     write_cb = NULL;
+    extended_write_cb = NULL;
     read_done_cb = NULL;
     cmd_done_cb = NULL;
     top_rdata_active = false;
     top_rdata_task = 0;
     top_rdata_remain = 0;
+    rw_sync_group_valid = false;
+    rw_sync_group = NO_GROUP;
+    rw_sync_group_state.assign(8, NO_GROUP);
+    rw_sync_in_write_group = false;
+    rw_sync_serial_cmd_cnt = 0;
+    rw_sync_reverse_cmd_cnt = 0;
+    rw_sync_rw_cmd_num = 0;
+    rw_sync_act_cmd_num = 0;
 
 #ifdef SYSARCH_PLATFORM
     IniFilename = "parameter/public.ini";
@@ -71,6 +80,7 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
     BA_SHIFT_BIT = cfg->getNumber("BA_SHIFT_BIT");
     SLOT_FIFO = cfg->getBool("SLOT_FIFO");
     DMC_RW_SYNC_EN = cfg->getBool("DMC_RW_SYNC_EN");
+    DMC_RW_SYNC_MODE = cfg->getNumber("DMC_RW_SYNC_MODE");
     TIME_ASSERT_EN = cfg->getBool("TIME_ASSERT_EN");
 
     IniFilename = "parameter/" + SYSTEM_CONFIG + ".ini";
@@ -360,6 +370,7 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
     GET_PARAM(BA_SHIFT_BIT, "BA_SHIFT_BIT", getUint);
     GET_PARAM(SLOT_FIFO, "SLOT_FIFO", getBool);
     GET_PARAM(DMC_RW_SYNC_EN, "DMC_RW_SYNC_EN", getBool);
+    GET_PARAM(DMC_RW_SYNC_MODE, "DMC_RW_SYNC_MODE", getUint);
     GET_PARAM(TIME_ASSERT_EN, "TIME_ASSERT_EN", getBool);
 
     IniFilename = IniFilePath + "/" + SYSTEM_CONFIG + ".ini";
@@ -940,37 +951,210 @@ LPMemorySystemTop::~LPMemorySystemTop() {
 
 }
 
+void LPMemorySystemTop::update_rw_sync_group() {
+    if (!DMC_RW_SYNC_EN || NUM_CHANS <= 1 || !GRP_RW_EN) {
+        rw_sync_group_valid = false;
+        for (size_t i = 0; i < NUM_CHANS; i++) {
+            channels[i]->memoryController->ClearRwSyncGroup();
+        }
+        return;
+    }
+
+    if (DMC_RW_SYNC_MODE == 0) {
+        rw_sync_group = channels[0]->memoryController->GetLocalRwGroup();
+    } else if (DMC_RW_SYNC_MODE == 1) {
+        bool any_read_group = false;
+        bool any_write_group = false;
+        for (size_t i = 0; i < NUM_CHANS; i++) {
+            uint8_t group = channels[i]->memoryController->GetLocalRwGroup();
+            any_read_group = any_read_group || group == READ_GROUP;
+            any_write_group = any_write_group || group == WRITE_GROUP;
+        }
+        if (any_read_group) {
+            rw_sync_group = READ_GROUP;
+        } else if (any_write_group) {
+            rw_sync_group = WRITE_GROUP;
+        } else {
+            rw_sync_group = NO_GROUP;
+        }
+    } else if (DMC_RW_SYNC_MODE == 2) {
+        if (rw_sync_prev_snapshot.size() != NUM_CHANS) {
+            rw_sync_prev_snapshot.resize(NUM_CHANS);
+            for (size_t i = 0; i < NUM_CHANS; i++) {
+                rw_sync_prev_snapshot[i] = channels[i]->memoryController->GetRwGroupSnapshot();
+            }
+        }
+        unsigned read_cnt = 0;
+        unsigned write_cnt = 0;
+        unsigned schedulable_read_cnt = 0;
+        unsigned schedulable_write_cnt = 0;
+        unsigned availability = 0;
+        unsigned high_qos_read_cnt = 0;
+        uint64_t read_retired_delta = 0;
+        uint64_t write_retired_delta = 0;
+        uint64_t rw_cmd_delta = 0;
+        uint64_t act_cmd_delta = 0;
+        bool timeout_read = false;
+        bool timeout_write = false;
+        for (size_t i = 0; i < NUM_CHANS; i++) {
+            MemoryController *ctrl = channels[i]->memoryController;
+            MemoryController::RwGroupSnapshot current = ctrl->GetRwGroupSnapshot();
+            MemoryController::RwGroupSnapshot &previous = rw_sync_prev_snapshot[i];
+            read_cnt += current.read_cnt;
+            write_cnt += current.write_cnt;
+            schedulable_read_cnt += current.schedulable_read_cnt;
+            schedulable_write_cnt += current.schedulable_write_cnt;
+            availability = max(availability, current.availability);
+            high_qos_read_cnt += current.high_qos_read_cnt;
+            read_retired_delta += current.read_retired_total - previous.read_retired_total;
+            write_retired_delta += current.write_retired_total - previous.write_retired_total;
+            rw_cmd_delta += current.rw_cmd_total - previous.rw_cmd_total;
+            act_cmd_delta += current.act_cmd_total - previous.act_cmd_total;
+            timeout_read = timeout_read || current.timeout_read_total != previous.timeout_read_total;
+            timeout_write = timeout_write || current.timeout_write_total != previous.timeout_write_total;
+            previous = current;
+        }
+        unsigned channel_scale = NUM_CHANS;
+        unsigned total_cnt = read_cnt + write_cnt;
+        uint8_t applied_group = rw_sync_group_state.front();
+        uint8_t target_group = rw_sync_group_state.back();
+        if (applied_group == READ_GROUP) {
+            rw_sync_serial_cmd_cnt += read_retired_delta;
+            rw_sync_reverse_cmd_cnt += write_retired_delta;
+        } else if (applied_group == WRITE_GROUP) {
+            rw_sync_serial_cmd_cnt += write_retired_delta;
+            rw_sync_reverse_cmd_cnt += read_retired_delta;
+        }
+        rw_sync_rw_cmd_num += rw_cmd_delta;
+        rw_sync_act_cmd_num += act_cmd_delta;
+        bool stat_quc_rhit_high = HARDWARE_RHIT_EN &&
+                rw_sync_act_cmd_num <= RHIT_ACT_CMD_NUM * channel_scale;
+        bool high_qos_trig = RCMD_HQOS_W2R_SWITCH_EN &&
+                high_qos_read_cnt >= RCMD_HQOS_W2R_RLEVELH * channel_scale;
+        bool nonflat_r2w_pre;
+        bool nonflat_w2r_pre;
+        if (DMC_V580 || DMC_V590) {
+            nonflat_r2w_pre = stat_quc_rhit_high ? read_cnt < CMD_RLEVELL * channel_scale :
+                    write_cnt >= CMD_WLEVELH * channel_scale && read_cnt <= RLEVEL_R2W * channel_scale;
+            nonflat_w2r_pre = stat_quc_rhit_high ? read_cnt > CMD_RLEVELH * channel_scale :
+                    write_cnt <= CMD_WLEVELL * channel_scale ||
+                    (total_cnt <= ALEVEL_W2R * channel_scale && (IS_HBM2E || IS_HBM3));
+        } else {
+            nonflat_r2w_pre = write_cnt >= CMD_WLEVELH * channel_scale;
+            nonflat_w2r_pre = write_cnt <= CMD_WLEVELL * channel_scale;
+        }
+        bool pushed = false;
+        if (target_group == NO_GROUP) {
+            if (total_cnt >= ENGRP_LEVEL * channel_scale) {
+                uint8_t next_group = write_cnt >= CMD_WLEVELH * channel_scale ||
+                        schedulable_read_cnt == 0 ? WRITE_GROUP : READ_GROUP;
+                rw_sync_group_state.push_back(next_group);
+                rw_sync_in_write_group = next_group == READ_GROUP;
+                pushed = true;
+            }
+        } else if (target_group == READ_GROUP) {
+            if (total_cnt < EXGRP_LEVEL * channel_scale && availability <= RWGRP_AUTO_BW) {
+                rw_sync_group_state.push_back(NO_GROUP);
+                rw_sync_serial_cmd_cnt = 0;
+                rw_sync_reverse_cmd_cnt = 0;
+                pushed = true;
+            } else if (timeout_write) {
+                rw_sync_group_state.push_back(WRITE_GROUP);
+                rw_sync_serial_cmd_cnt = 0;
+                rw_sync_reverse_cmd_cnt = 0;
+                rw_sync_in_write_group = true;
+                pushed = true;
+            } else if (((rw_sync_serial_cmd_cnt >= SERIAL_RLEVELL * channel_scale && nonflat_r2w_pre) ||
+                    rw_sync_serial_cmd_cnt >= SERIAL_RLEVELH * channel_scale || schedulable_read_cnt == 0) &&
+                    schedulable_write_cnt != 0 && !high_qos_trig) {
+                rw_sync_group_state.push_back(WRITE_GROUP);
+                rw_sync_serial_cmd_cnt = 0;
+                rw_sync_reverse_cmd_cnt = 0;
+                rw_sync_in_write_group = false;
+                pushed = true;
+            } else if (rw_sync_in_write_group &&
+                    rw_sync_reverse_cmd_cnt >= RW_GRPCHG_W2R_TH * channel_scale && !high_qos_trig) {
+                rw_sync_in_write_group = false;
+                rw_sync_reverse_cmd_cnt = 0;
+            }
+        } else if (target_group == WRITE_GROUP) {
+            if (total_cnt < EXGRP_LEVEL * channel_scale && availability <= RWGRP_AUTO_BW) {
+                rw_sync_group_state.push_back(NO_GROUP);
+                rw_sync_serial_cmd_cnt = 0;
+                rw_sync_reverse_cmd_cnt = 0;
+                pushed = true;
+            } else if (timeout_read || high_qos_trig && schedulable_read_cnt != 0) {
+                rw_sync_group_state.push_back(READ_GROUP);
+                rw_sync_serial_cmd_cnt = 0;
+                rw_sync_reverse_cmd_cnt = 0;
+                rw_sync_in_write_group = timeout_read ? false : true;
+                pushed = true;
+            } else if (((rw_sync_serial_cmd_cnt >= SERIAL_WLEVELL * channel_scale && nonflat_w2r_pre) ||
+                    rw_sync_serial_cmd_cnt >= SERIAL_WLEVELH * channel_scale || schedulable_write_cnt == 0) &&
+                    schedulable_read_cnt != 0) {
+                rw_sync_group_state.push_back(READ_GROUP);
+                rw_sync_serial_cmd_cnt = 0;
+                rw_sync_reverse_cmd_cnt = 0;
+                rw_sync_in_write_group = true;
+                pushed = true;
+            } else if (!rw_sync_in_write_group &&
+                    rw_sync_reverse_cmd_cnt >= RW_GRPCHG_R2W_TH * channel_scale) {
+                rw_sync_in_write_group = true;
+                rw_sync_reverse_cmd_cnt = 0;
+            }
+        } else {
+            assert(0);
+        }
+        if (!pushed) rw_sync_group_state.push_back(target_group);
+        rw_sync_group_state.erase(rw_sync_group_state.begin());
+        if (rw_sync_rw_cmd_num >= RHIT_RW_CMD_NUM * channel_scale) {
+            rw_sync_rw_cmd_num = 0;
+            rw_sync_act_cmd_num = 0;
+        }
+        rw_sync_group = rw_sync_group_state.front();
+    } else {
+        ERROR("Invalid DMC_RW_SYNC_MODE: "<<DMC_RW_SYNC_MODE);
+        assert(0);
+    }
+
+    rw_sync_group_valid = true;
+    for (size_t i = 0; i < NUM_CHANS; i++) {
+        channels[i]->memoryController->SetRwSyncGroup(rw_sync_group);
+    }
+}
+
 void LPMemorySystemTop::update() {
 //    if (RMW_ENABLE) {
 //        rmw->update();
 //    }
-    if (DMC_RW_SYNC_EN && NUM_CHANS >= 2) {
-        // 第一步：先不执行 update，收集所有通道当前的读写切换灰度状态
-        bool global_rw_switch_gray = false; 
-        for (size_t i = 0; i < NUM_CHANS; i++) {
-            if (channels[i]->memoryController->IsRWGray()) {
-                global_rw_switch_gray = true;
-                break;
-            }
-        }
-        // 第二步：Master 只接收灰度信号（决定它自己的 LC 是否要拦截），不接收外部的 Target Group
-        channels[0]->memoryController->SetRwSyncHint(false, NO_GROUP, global_rw_switch_gray);
-        // channels[0]->memoryController->SetRwSyncHint(false, NO_GROUP, false);
-        channels[0]->update();
-        MemoryController *master = channels[0]->memoryController;
-        for (size_t i = 1; i < NUM_CHANS; i++) {
-            channels[i]->memoryController->SetRwSyncHint(true,
-                    master->GetRwGroupTarget(),
-                    global_rw_switch_gray);
-                    // false);
-            channels[i]->update();
-        }
-    } else {
-        for (size_t i = 0; i < NUM_CHANS; i++) {
-            channels[i]->memoryController->SetRwSyncHint(false, NO_GROUP, false);
-            channels[i]->update();
-        }
+    // if (DMC_RW_SYNC_EN && NUM_CHANS >= 2) {
+    //     // 第一步：先不执行 update，收集所有通道当前的读写切换灰度状态
+    //     bool global_rw_switch_gray = false; 
+    //     for (size_t i = 0; i < NUM_CHANS; i++) {
+    //         if (channels[i]->memoryController->IsRWGray()) {
+    //             global_rw_switch_gray = true;
+    //             break;
+    //         }
+    //     }
+    //     // 第二步：Master 只接收灰度信号（决定它自己的 LC 是否要拦截），不接收外部的 Target Group
+    //     channels[0]->memoryController->SetRwSyncHint(false, NO_GROUP, global_rw_switch_gray);
+    //     // channels[0]->memoryController->SetRwSyncHint(false, NO_GROUP, false);
+    //     channels[0]->update();
+    //     MemoryController *master = channels[0]->memoryController;
+    //     for (size_t i = 1; i < NUM_CHANS; i++) {
+    //         channels[i]->memoryController->SetRwSyncHint(true,
+    //                 master->GetRwGroupTarget(),
+    //                 global_rw_switch_gray);
+    //                 // false);
+    //         channels[i]->update();
+    //     }
+    // } else {
+    update_rw_sync_group();
+    for (size_t i = 0; i < NUM_CHANS; i++) {
+        // channels[i]->memoryController->SetRwSyncHint(false, NO_GROUP, false);
+        channels[i]->update();
     }
+    // }
 
     // Top 层的串行化向上游发送逻辑 (仲裁与汇聚吐出)
     // 1. 吐出 Read Data
@@ -1029,7 +1213,10 @@ void LPMemorySystemTop::update() {
     // 2. 吐出 Write Response
     if (!top_wresp_fifo.empty()) {
         auto &pkt = top_wresp_fifo.front();
-        if (write_cb == NULL || (*write_cb)(pkt.channel, pkt.task, pkt.readDataEnterDmcTime, pkt.reqAddToDmcTime, pkt.reqEnterDmcBufTime)) {
+        bool accepted = extended_write_cb != NULL
+                ? (*extended_write_cb)(pkt.channel, pkt.task, pkt.readDataEnterDmcTime, pkt.reqAddToDmcTime, pkt.reqEnterDmcBufTime, pkt.merge_flag, pkt.first_task)
+                : (write_cb == NULL || (*write_cb)(pkt.channel, pkt.task, pkt.readDataEnterDmcTime, pkt.reqAddToDmcTime, pkt.reqEnterDmcBufTime));
+        if (accepted) {
             top_wresp_fifo.pop_front();
         }
     }
@@ -1183,6 +1370,11 @@ bool LPMemorySystemTop::addData(uint32_t *data,uint32_t channel,uint64_t id) {
     return ret;
 }
 
+bool LPMemorySystemTop::canAcceptData(uint32_t channel, uint64_t id) const {
+    if (EM_ENABLE && EM_MODE == 0) channel = 0;
+    return channel < channels.size() && channels[channel]->canAcceptData(id);
+}
+
 
 void LPMemorySystemTop::RegisterCallbacks(
     TransactionCompleteCB *readData,
@@ -1191,6 +1383,19 @@ void LPMemorySystemTop::RegisterCallbacks(
     TransactionCompleteCB *cmdDone ) {
     read_cb = readData;
     write_cb = writeDone;
+    extended_write_cb = NULL;
+    read_done_cb = readDone;
+    cmd_done_cb = cmdDone;
+}
+
+void LPMemorySystemTop::RegisterCallbacks(
+    TransactionCompleteCB *readData,
+    WriteTransactionCompleteCB *writeDone,
+    TransactionCompleteCB *readDone,
+    TransactionCompleteCB *cmdDone ) {
+    read_cb = readData;
+    write_cb = NULL;
+    extended_write_cb = writeDone;
     read_done_cb = readDone;
     cmd_done_cb = cmdDone;
 }
@@ -1230,7 +1435,10 @@ bool LPMemorySystemTop::handle_read_data(unsigned channel, uint64_t task,
 bool LPMemorySystemTop::handle_write_done(unsigned channel, uint64_t task,
         double readDataEnterDmcTime, double reqAddToDmcTime, double reqEnterDmcBufTime) {
     if (top_wresp_fifo.size() >= TOP_RESP_FIFO_DEPTH) return false;
-    top_wresp_fifo.push_back({channel, task, readDataEnterDmcTime, reqAddToDmcTime, reqEnterDmcBufTime});
+    uint64_t first_task = 0xffffffffffffffffull;
+    size_t local_channel = channels.empty() ? 0 : channel % channels.size();
+    bool merge_flag = !channels.empty() && channels[local_channel]->takeMergedWrite(task, first_task);
+    top_wresp_fifo.push_back({channel, task, readDataEnterDmcTime, reqAddToDmcTime, reqEnterDmcBufTime, merge_flag, first_task});
     return true;
 }
 
@@ -1352,3 +1560,4 @@ void LPMemorySystemTop::wdata_check(uint64_t task, uint8_t channel) {
  * moved back to MemorySystem
  **/
 }
+
