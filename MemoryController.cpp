@@ -3,6 +3,32 @@
 
 using namespace LPDDRSim;
 //==============================================================================
+static bool is_dmc_merge_pri_candidate(Transaction *trans) {
+    if (!WCMD_MERGE_PRI_EN || WCMD_MERGE_EN) return false;
+    if (trans == NULL) return false;
+    if (trans->transactionType != DATA_WRITE) return false;
+    if (!trans->mergeflag) return false;
+    if (trans->mask_wcmd) return false;
+    if (trans->ecc_flag) return false;
+    return ((trans->burst_length + 1) * DMC_DATA_BUS_BITS / 8) == 128;
+}
+
+static bool can_dmc_merge_pri_pair(Transaction *first, Transaction *second) {
+    if (!is_dmc_merge_pri_candidate(first) || !is_dmc_merge_pri_candidate(second)) return false;
+    if (first->channel != second->channel) return false;
+    uint64_t first_addr = first->address;
+    uint64_t second_addr = second->address;
+    uint64_t low_addr = first_addr < second_addr ? first_addr : second_addr;
+    uint64_t high_addr = first_addr < second_addr ? second_addr : first_addr;
+    return ((low_addr ^ high_addr) == 128) && ((low_addr & 255) == 0);
+}
+
+static void update_cmd_pri(vector <Cmd *> &cmd_queue, uint64_t task, unsigned pri) {
+    for (auto &cmd : cmd_queue) {
+        if (cmd != NULL && cmd->task == task) cmd->pri = pri;
+    }
+}
+
 MemoryController::MemoryController(MemorySystem *parent, ostream &DDRSim_log_,
         ostream &trace_log_, ostream &cmdnum_log_): DDRSim_log(DDRSim_log_),
         trace_log(trace_log_), cmdnum_log(cmdnum_log_) {
@@ -665,6 +691,18 @@ MemoryController::MemoryController(MemorySystem *parent, ostream &DDRSim_log_,
     avai_sqrt = 0;
     rw_group_state.reserve(8);
     for (size_t i = 0; i < 8; i ++) rw_group_state.push_back(NO_GROUP);
+    rw_schedulable_read_cnt = 0;
+    rw_schedulable_write_cnt = 0;
+    rw_group_read_retired_total = 0;
+    rw_group_write_retired_total = 0;
+    rw_group_rw_cmd_total = 0;
+    rw_group_act_cmd_total = 0;
+    rw_group_timeout_read_total = 0;
+    rw_group_timeout_write_total = 0;
+    rw_sync_group_valid = false;
+    rw_sync_group = NO_GROUP;
+    rw_sync_in_write_group = false;
+    rw_sync_ch_cmd_cnt = 0;
     in_write_group = false; // true is write group, false is read group
     rk_grp_state = NO_RGRP;
     real_rk_grp_state = NO_RGRP;
@@ -1055,6 +1093,12 @@ bool MemoryController::returnReadData(unsigned int channel_num,unsigned long lon
 
 //receive the write data from CPU
 void MemoryController::receiveFromCPU(unsigned int *data, uint64_t task) {
+    if (wdata_order_queue.empty() || wdata_order_queue.front().task != task) {
+        ERROR(setw(10)<<now()<<" -- MC WDATA ORDER ERROR :: actual_task="<<task
+                <<" expected_task="<<(wdata_order_queue.empty() ? 0xffffffffffffffffull : wdata_order_queue.front().task));
+        assert(0);
+    }
+    if (--wdata_order_queue.front().remaining_beats == 0) wdata_order_queue.pop_front();
     unsigned second_time = 0;
     unsigned third_time = 0;
     if (!IECC_ENABLE || (!tasks_info[task].wr_ecc && !tasks_info[task].rd_ecc)) {
@@ -1081,6 +1125,10 @@ void MemoryController::receiveFromCPU(unsigned int *data, uint64_t task) {
     if (DEBUG_BUS) {
         PRINTN(setw(10)<<now()<<" -- R_CPU :: Get Data from CPU, task="<<task<<endl);
     }
+}
+
+bool MemoryController::canReceiveWdata(uint64_t task) const {
+    return !wdata_order_queue.empty() && wdata_order_queue.front().task == task;
 }
 
 //gives the memory controller a handle on the rank objects
@@ -3628,11 +3676,18 @@ void MemoryController::all_bank_refresh(unsigned rank, unsigned sc) {
         return;
     }
 
+    if (refreshALL[rank][sc].refresh_cnt >= ABR_PSTPND_LEVEL) {
+        if (DEBUG_BUS && !refreshALL[rank][sc].refreshWaiting) {
+            PRINTN(setw(10)<<now()<<" -- POS :: refresh cnt="<<refreshALL[rank][sc].refresh_cnt<<", force refresh"<<", rank="<<rank<<", sc="<<sc<<endl);
+        }
+        refreshALL[rank][sc].refreshWaiting = true;
+    }
+
     //guarantee rd/wr cmd with issue_size!=0 not broken by refresh
     bool has_issue_size = false;
     for (auto &trans : transactionQueue) {
         unsigned trans_sc = (trans->bankIndex % NUM_BANKS) / sc_bank_num;
-        if (trans->issue_size != 0 && trans->rank == rank && trans_sc == sc) {
+        if (trans->issue_size != 0 && trans->issue_size < trans->data_size && trans->rank == rank && trans_sc == sc) {
             has_issue_size =true;
         }
     }
@@ -3751,12 +3806,7 @@ void MemoryController::all_bank_refresh(unsigned rank, unsigned sc) {
         }
     }
 
-    if (refreshALL[rank][sc].refresh_cnt >= ABR_PSTPND_LEVEL) {
-        if (DEBUG_BUS) {
-            PRINTN(setw(10)<<now()<<" -- POS :: refresh cnt="<<refreshALL[rank][sc].refresh_cnt<<", force refresh"<<", rank="<<rank<<", sc="<<sc<<endl);
-        }
-        refreshALL[rank][sc].refreshWaiting = true;
-    } else if (refreshALL[rank][sc].refresh_cnt > 0) {
+    if (refreshALL[rank][sc].refresh_cnt < ABR_PSTPND_LEVEL && refreshALL[rank][sc].refresh_cnt > 0) {
         if (sc_cnt[rank][sc] == 0) {      //todo: revise for e-mode
             if (SBR_IDLE_EN) {
                 if (DEBUG_BUS) {
@@ -5032,11 +5082,11 @@ unsigned MemoryController::priority(Cmd *cmd) {
 unsigned MemoryController::priority_pri(Cmd *cmd) {
     unsigned level_ret = cmd->pri;
     if (RCMD_BANK_ARB_EN && cmd->cmd_type >= READ_CMD && cmd->cmd_type <= READ_P_CMD) {
-        if (cmd->bankIndex % NUM_BANKS == max_rcmd_bank[cmd->rank] && rw_group_state[0] != NO_GROUP) {
+        if (cmd->bankIndex % NUM_BANKS == max_rcmd_bank[cmd->rank] && GetEffectiveRwGroup() != NO_GROUP) {
             if (cmd->pri > RCMD_BANK_ARB_PRI) level_ret = RCMD_BANK_ARB_PRI;
         }
     } else if (WCMD_BANK_ARB_EN && cmd->cmd_type >= WRITE_CMD && cmd->cmd_type <= WRITE_MASK_P_CMD) {
-        if (cmd->bankIndex % NUM_BANKS == max_wcmd_bank[cmd->rank] && rw_group_state[0] != NO_GROUP) {
+        if (cmd->bankIndex % NUM_BANKS == max_wcmd_bank[cmd->rank] && GetEffectiveRwGroup() != NO_GROUP) {
             if (cmd->pri > WCMD_BANK_ARB_PRI) level_ret = WCMD_BANK_ARB_PRI;
         }
     }
@@ -5049,7 +5099,7 @@ descriptor: main scheduler,The purpose of this function is selecting the best ta
 void MemoryController::scheduler() {
     if (CmdQueue.empty()) return;
 
-    if (RCMD_BANK_ARB_EN && rw_group_state[0] != NO_GROUP) {
+    if (RCMD_BANK_ARB_EN && GetEffectiveRwGroup() != NO_GROUP) {
         for (unsigned i = 0; i < NUM_RANKS; i ++) {
             unsigned max_cnt = 0;
             for (unsigned j = 0; j < NUM_BANKS; j ++) {
@@ -5063,7 +5113,7 @@ void MemoryController::scheduler() {
         }
     }
 
-    if (WCMD_BANK_ARB_EN && rw_group_state[0] != NO_GROUP) {
+    if (WCMD_BANK_ARB_EN && GetEffectiveRwGroup() != NO_GROUP) {
         for (unsigned i = 0; i < NUM_RANKS; i ++) {
             unsigned max_cnt = 0;
             for (unsigned j = 0; j < NUM_BANKS; j ++) {
@@ -5171,6 +5221,8 @@ void MemoryController::scheduler() {
             sch_tout_cmd = true;
             sch_tout_type = c->type;
             sch_tout_rank = c->rank;
+            if (c->type == DATA_READ) rw_group_timeout_read_total++;
+            else rw_group_timeout_write_total++;
         }
         if (PreCmd.trans_type != c->type) {
             rw_switch_cnt ++;
@@ -5294,17 +5346,29 @@ void MemoryController::scheduler() {
     }
 
     if (GRP_RW_EN) {
-        if (rw_group_state[0] == READ_GROUP && in_write_group && !c->timeout &&
+        uint8_t local_rw_group = rw_group_state[0];
+        if (local_rw_group == READ_GROUP && in_write_group && !c->timeout &&
                 (c->cmd_type == READ_CMD || c->cmd_type == READ_P_CMD)) {
             in_write_group = false;
             if (DEBUG_BUS) {
                 PRINTN(setw(10)<<now()<<" -- GRP_REAL :: Real Change to READ_GROUP"<<endl);
             }
-        } else if (rw_group_state[0] == WRITE_GROUP && !in_write_group && !c->timeout
+        } else if (local_rw_group == WRITE_GROUP && !in_write_group && !c->timeout
                 && (c->cmd_type >= WRITE_CMD && c->cmd_type <= WRITE_MASK_P_CMD)) {
             in_write_group = true;
             if (DEBUG_BUS) {
                 PRINTN(setw(10)<<now()<<" -- GRP_REAL :: Real Change to WRITE_GROUP"<<endl);
+            }
+        }
+        if (rw_sync_group_valid) {
+            if (rw_sync_group == READ_GROUP && rw_sync_in_write_group && !c->timeout &&
+                    (c->cmd_type == READ_CMD || c->cmd_type == READ_P_CMD)) {
+                rw_sync_in_write_group = false;
+                rw_sync_ch_cmd_cnt = 0;
+            } else if (rw_sync_group == WRITE_GROUP && !rw_sync_in_write_group && !c->timeout &&
+                    (c->cmd_type >= WRITE_CMD && c->cmd_type <= WRITE_MASK_P_CMD)) {
+                rw_sync_in_write_group = true;
+                rw_sync_ch_cmd_cnt = 0;
             }
         }
     }
@@ -5686,6 +5750,7 @@ void MemoryController::scheduler() {
             bankStates[c->bankIndex].state->pageOpenTime = now();
             act_executing[c->bankIndex] = false;
             act_cmd_num ++;
+            rw_group_act_cmd_total++;
             for (auto &trans : transactionQueue) {
                 if (trans->task != c->task) continue;
                 if (trans->transactionType != DATA_READ) trans->trcd_met = now() + tRCD_WR;
@@ -6434,6 +6499,8 @@ void MemoryController::update() {
 
     update_grt_fifo();
 
+    update_rw_schedulable_counts();
+
     for (size_t i = 0; i < CORE_CONCURR; i ++) {
         if (now() % CORE_CONCURR_PRD != 0 && i == 1) break;
         core_concurr_en = (i == 0);
@@ -6668,7 +6735,8 @@ void MemoryController::update_group_state() {
             continue;
         if (trans->transactionType == DATA_READ) {
             has_rd_cmd[trans->rank] = true;
-        } else if (trans->data_ready_cnt == (trans->burst_length + 1)) {
+        } else if (WCMD_DATA_READY_MODE == 1 ||
+                trans->data_ready_cnt == (trans->burst_length + 1)) {
             has_wr_cmd[trans->rank] = true;
         }
     }
@@ -6847,22 +6915,31 @@ void MemoryController::rank_group_weight(unsigned * rank, unsigned * type) {
     }
 }
 
-void MemoryController::update_rwgroup_state() {
-    if (GRP_RANK_EN || !GRP_RW_EN) return;
-
-    bool has_read_cmd = false;
-    bool has_write_cmd = false;
+void MemoryController::update_rw_schedulable_counts() {
+    rw_schedulable_read_cnt = 0;
+    rw_schedulable_write_cnt = 0;
     for (auto &trans : transactionQueue) {
         unsigned sub_channel = (trans->bankIndex % NUM_BANKS) / sc_bank_num;
         if (trans->addrconf) continue;
         if (trans->pre_act) continue;
         if (now() < trans->enter_que_time) continue;
         if (refreshALL[trans->rank][sub_channel].refreshing) continue;
-        //if (refreshPerBank[trans->bankIndex].refreshing) continue;
         if (trans->bp_by_tout) continue;
-        if (trans->transactionType == DATA_READ) has_read_cmd = true;
-        else if (trans->data_ready_cnt == (trans->burst_length + 1)) has_write_cmd = true;
+        if (trans->transactionType == DATA_READ) {
+            rw_schedulable_read_cnt++;
+        } else if (WCMD_DATA_READY_MODE == 1 ||
+                trans->data_ready_cnt == (trans->burst_length + 1)) {
+            rw_schedulable_write_cnt++;
+        }
     }
+}
+
+void MemoryController::update_rwgroup_state() {
+    if (GRP_RANK_EN || !GRP_RW_EN) return;
+
+    update_rw_schedulable_counts();
+    bool has_read_cmd = rw_schedulable_read_cnt != 0;
+    bool has_write_cmd = rw_schedulable_write_cnt != 0;
 
     bool nonflat_r2w_pre, nonflat_w2r_pre;
     bool stat_quc_rhit_high = HARDWARE_RHIT_EN && act_cmd_num <= RHIT_ACT_CMD_NUM;
@@ -7013,6 +7090,39 @@ void MemoryController::update_rwgroup_state() {
     sch_tout_cmd = false;
 }
 
+uint8_t MemoryController::GetEffectiveRwGroup() const {
+    return rw_sync_group_valid ? rw_sync_group : rw_group_state[0];
+}
+
+MemoryController::RwGroupSnapshot MemoryController::GetRwGroupSnapshot() const {
+    RwGroupSnapshot snapshot;
+    snapshot.read_cnt = que_read_cnt;
+    snapshot.write_cnt = que_write_cnt;
+    snapshot.schedulable_read_cnt = rw_schedulable_read_cnt;
+    snapshot.schedulable_write_cnt = rw_schedulable_write_cnt;
+    snapshot.availability = availability;
+    snapshot.high_qos_read_cnt = accumulate(que_read_highqos_cnt.begin(), que_read_highqos_cnt.end(), 0);
+    snapshot.read_retired_total = rw_group_read_retired_total;
+    snapshot.write_retired_total = rw_group_write_retired_total;
+    snapshot.rw_cmd_total = rw_group_rw_cmd_total;
+    snapshot.act_cmd_total = rw_group_act_cmd_total;
+    snapshot.timeout_read_total = rw_group_timeout_read_total;
+    snapshot.timeout_write_total = rw_group_timeout_write_total;
+    return snapshot;
+}
+
+void MemoryController::SetRwSyncGroup(uint8_t group) {
+    if (!rw_sync_group_valid || rw_sync_group != group) {
+        rw_sync_ch_cmd_cnt = 0;
+    }
+    rw_sync_group_valid = true;
+    rw_sync_group = group;
+}
+
+void MemoryController::ClearRwSyncGroup() {
+    rw_sync_group_valid = false;
+}
+
 void MemoryController::communicate() {
 }
 
@@ -7044,6 +7154,8 @@ void MemoryController::update_que() {
 //        unsigned bank_start = sub_channel * NUM_BANKS /sc_num;
 //        unsigned bank_pair_start = sub_channel * pbr_bank_num;
         if (t->issue_size < t->data_size) continue;
+        if (WCMD_DATA_READY_MODE == 1 && t->transactionType == DATA_WRITE &&
+                t->data_ready_cnt <= t->burst_length) continue;
         if (t->issue_size > t->data_size) {
             ERROR(setw(10)<<now()<<" -- Error issue_size, task="<<t->task<<" data_size="
                     <<t->data_size<<" issue_size="<<t->issue_size);
@@ -7066,6 +7178,8 @@ void MemoryController::update_que() {
             if (!GRP_RANK_EN && GRP_RW_EN && !t->timeout) {
                 if (rw_group_state[0] == READ_GROUP) serial_cmd_cnt ++;
                 else if (rw_group_state[0] == WRITE_GROUP) rwgrp_ch_cmd_cnt ++;
+                if (rw_sync_group_valid && rw_sync_group == WRITE_GROUP) rw_sync_ch_cmd_cnt++;
+                rw_group_read_retired_total++;
             }
             //remove conflict
             for (size_t j = i + 1; j < len; j++) {
@@ -7094,6 +7208,8 @@ void MemoryController::update_que() {
             if (!GRP_RANK_EN && GRP_RW_EN && !t->timeout) {
                 if (rw_group_state[0] == READ_GROUP) rwgrp_ch_cmd_cnt ++;
                 else if (rw_group_state[0] == WRITE_GROUP) serial_cmd_cnt ++;
+                if (rw_sync_group_valid && rw_sync_group == READ_GROUP) rw_sync_ch_cmd_cnt++;
+                rw_group_write_retired_total++;
             }
             w_bank_cnt[t->bankIndex] --;
             w_bg_cnt[t->rank][t->group] --;
@@ -7152,6 +7268,7 @@ void MemoryController::update_que() {
         transactionQueue.erase(transactionQueue.begin() + i);
         dmc_cmd_cnt ++;
         rw_cmd_num ++;
+        rw_group_rw_cmd_total++;
         if (GRP_RANK_EN && !t->timeout && rk_grp_state != NO_RGRP) {
             if (rk_grp_state == real_rk_grp_state) {
                 serial_cmd_cnt ++;
@@ -7219,7 +7336,7 @@ void MemoryController::que_pipeline() {
     }
     rw_exec_cnt = 0;
     for (auto &trans : transactionQueue) {
-        if (trans->issue_size != 0) rw_exec_cnt ++;
+        if (trans->issue_size != 0 && trans->issue_size < trans->data_size) rw_exec_cnt ++;
     }
     
     //label lqos cmd ( pri lower than LQOS_BP_LEVEL)
@@ -7241,11 +7358,11 @@ void MemoryController::que_pipeline() {
         //if (refreshPerBank[t->bankIndex].refreshing) continue;
         if (bankStates[t->bankIndex].state->currentBankState == RowActive &&
                 t->row == bankStates[t->bankIndex].state->openRowAddress) {
-            if ((rw_group_state[0] == READ_GROUP && t->transactionType == DATA_READ) || (rk_grp_state == t_state)
-                    || (rw_group_state[0] == WRITE_GROUP && t->transactionType == DATA_WRITE)) {
+            if ((GetEffectiveRwGroup() == READ_GROUP && t->transactionType == DATA_READ) || (rk_grp_state == t_state)
+                    || (GetEffectiveRwGroup() == WRITE_GROUP && t->transactionType == DATA_WRITE)) {
                 bankStates[t->bankIndex].has_cmd_rowhit = true;
             }
-            if (rw_group_state[0] == READ_GROUP && t->qos <= SWITCH_HQOS_LEVEL && t->transactionType == DATA_READ) {
+            if (GetEffectiveRwGroup() == READ_GROUP && t->qos <= SWITCH_HQOS_LEVEL && t->transactionType == DATA_READ) {
                 bankStates[t->bankIndex].has_highqos_cmd_rowhit = RHIT_HQOS_BREAK_EN;
             }
         }
@@ -7272,7 +7389,7 @@ void MemoryController::que_pipeline() {
         }
 
         if ((RHIT_BREAK_EN && bankStates[trans->bankIndex].ser_rhit_cnt >= RHIT_BREAK_LEVEL) ||
-                (RHIT_HQOS_BREAK_EN && rw_group_state[0] == READ_GROUP &&
+                (RHIT_HQOS_BREAK_EN && GetEffectiveRwGroup() == READ_GROUP &&
                  highqos_r_bank_cnt[trans->bankIndex] >= RHIT_HQOS_BREAK_OTH_RCMD_LEVEL)) {
             if (bankStates[trans->bankIndex].state->currentBankState == RowActive &&
                     trans->row == bankStates[trans->bankIndex].state->openRowAddress &&
@@ -7295,14 +7412,14 @@ void MemoryController::que_pipeline() {
             if (trans->row != bankStates[bank].state->openRowAddress) continue;
             if (bankStates[bank].has_rhit_break) continue;
             if (trans->transactionType == DATA_READ && rcmd_bp_byrp && bank == trans->bankIndex) break;
-            if ((rw_group_state[0] == NO_GROUP && !GRP_RANK_EN) || (rk_grp_state == NO_RGRP && !GRP_RW_EN)) {
+            if ((GetEffectiveRwGroup() == NO_GROUP && !GRP_RANK_EN) || (rk_grp_state == NO_RGRP && !GRP_RW_EN)) {
                 bankStates[bank].hold_precharge = true;
                 if (DEBUG_BUS) {
                     PRINTN(setw(10)<<now()<<" -- HPRE :: NO_GROUP, task="
                             <<trans->task<<", bank="<<trans->bankIndex<<endl);
                 }
                 break;
-            } else if (rw_group_state[0] == READ_GROUP && trans->transactionType == DATA_READ &&
+            } else if (GetEffectiveRwGroup() == READ_GROUP && trans->transactionType == DATA_READ &&
                     bankStates[bank].state->lastCmdType == DATA_READ) {
                 bankStates[bank].hold_precharge = true;
                 if (DEBUG_BUS) {
@@ -7310,7 +7427,7 @@ void MemoryController::que_pipeline() {
                             <<trans->task<<", bank="<<trans->bankIndex<<endl);
                 }
                 break;
-            } else if (rw_group_state[0] == WRITE_GROUP && trans->transactionType != DATA_READ &&
+            } else if (GetEffectiveRwGroup() == WRITE_GROUP && trans->transactionType != DATA_READ &&
                     bankStates[bank].state->lastCmdType != DATA_READ) {
                 bankStates[bank].hold_precharge = true;
                 if (DEBUG_BUS) {
@@ -7347,7 +7464,7 @@ void MemoryController::que_pipeline() {
                 }
             }
         }
-        if (DMC_V580 && GRP_RW_EN && rw_group_state[0] == NO_GROUP &&
+        if (DMC_V580 && GRP_RW_EN && GetEffectiveRwGroup() == NO_GROUP &&
                 (PreCmd.type == READ_CMD || PreCmd.type == READ_P_CMD)) {
             for (auto &trans : transactionQueue) {
                 if (trans->addrconf) continue;
@@ -7599,7 +7716,8 @@ void MemoryController::data_fresh() {
                 rdata_type |= (msg.sub_src << 12); // bit[13:12] is pf_type
                 msg.reqAddToDmcTime = double(rdata_type);
 #endif
-                if ((!IECC_ENABLE || !tasks_info[task].rd_ecc) && (!RMW_ENABLE || (!read_data_buffer[i].mask_wcmd && RMW_ENABLE))) {
+                bool rmw_active = RMW_ENABLE || WCMD_MERGE_EN;
+                if ((!IECC_ENABLE || !tasks_info[task].rd_ecc) && (!rmw_active || !read_data_buffer[i].mask_wcmd)) {
                     read_data_buffer[i].readDataEnterDmcTime = now() * tDFI;
                     sys_bp = !returnReadData(read_data_buffer[i].channel, task,
                             read_data_buffer[i].readDataEnterDmcTime,
@@ -7648,7 +7766,7 @@ void MemoryController::data_fresh() {
                     if (msg.burst_cnt == (msg.burst_length + 1)) {
                         pending_TransactionQue.erase(task);
                         if (IECC_ENABLE) tasks_info[task].rd_finish = true;
-                        if (RMW_ENABLE && read_data_buffer[i].mask_wcmd==true) {
+                        if ((RMW_ENABLE || WCMD_MERGE_EN) && read_data_buffer[i].mask_wcmd==true) {
                             auto iter = rmw_rd_finish.find(task);
                             if (iter == rmw_rd_finish.end()){
                                 ERROR(setw(10)<<now()<<" -- Merge Read Data Mismatch, task="<<task);
@@ -7719,7 +7837,7 @@ void MemoryController::data_fresh() {
         rdata_type |= (msg.sub_src << 12); // bit[13:12] is pf_type
         msg.reqAddToDmcTime = double(rdata_type);
 #endif
-        if ((!IECC_ENABLE || !tasks_info[task].rd_ecc)) {
+        if ((!IECC_ENABLE || !tasks_info[task].rd_ecc) && (!(RMW_ENABLE || WCMD_MERGE_EN) || !return_rdata.mask_wcmd)) {
             return_rdata.readDataEnterDmcTime = now() * tDFI;
             sys_bp = !returnReadData(return_rdata.channel, task,
                     return_rdata.readDataEnterDmcTime,
@@ -7761,7 +7879,7 @@ void MemoryController::data_fresh() {
             if (msg.burst_cnt == (msg.burst_length + 1)) {
                 pending_TransactionQue.erase(task);
                 if (IECC_ENABLE) tasks_info[task].rd_finish = true;
-                if (RMW_ENABLE && return_rdata.mask_wcmd==true) {
+                if ((RMW_ENABLE || WCMD_MERGE_EN) && return_rdata.mask_wcmd==true) {
                     auto iter = rmw_rd_finish.find(task);
                     if (iter == rmw_rd_finish.end()){
                         ERROR(setw(10)<<now()<<" -- Merge Read Data Mismatch, task="<<task);
@@ -7784,7 +7902,7 @@ void MemoryController::data_fresh() {
         }
     }
 
-    if (rp_fifo.size() < RPFIFO_AMFULL_TH) {
+    if (rp_fifo.empty()) {
         rcmd_bp_byrp = false;
     }
 
@@ -8144,7 +8262,8 @@ void MemoryController::check_timeout_and_aging() {
     // generate original timeout flag
     for (auto &trans : transactionQueue) {
         if (now() < trans->arb_time) continue;
-        if (trans->transactionType == DATA_WRITE && trans->data_ready_cnt <= trans->burst_length) continue;
+        if (WCMD_DATA_READY_MODE == 0 && trans->transactionType == DATA_WRITE &&
+                trans->data_ready_cnt <= trans->burst_length) continue;
         if (trans->addrconf) continue;
         if (!trans->timeout && ((now() - trans->timeAdded >= trans->timeout_th &&
                 trans->timeout_th != 0) || trans->qos == 0)) {
@@ -8349,7 +8468,7 @@ void MemoryController::need_issue(Transaction *trans) {
                 trans->nextCmd = INVALID;
             }
         } else {
-            if (!bankStates[trans->bankIndex].hold_precharge) {
+            if (!bankStates[trans->bankIndex].hold_precharge || trans->issue_size != 0) {
                 trans->nextCmd = PRECHARGE_PB_CMD;
             }
             else trans->nextCmd = INVALID;
@@ -8497,6 +8616,10 @@ void MemoryController::lc(Transaction *t) {
         return;
     }
 
+    if (t->issue_size >= t->data_size) {
+        return;
+    }
+
     need_issue(t);
 
     if (dresp_cnt >= DRESP_BP_TH && t->nextCmd >= WRITE_CMD && t->nextCmd <= READ_P_CMD
@@ -8530,7 +8653,7 @@ void MemoryController::lc(Transaction *t) {
         return;
     }
 
-    if (t->transactionType != DATA_READ && t->nextCmd != ACTIVATE1_CMD &&
+    if (WCMD_DATA_READY_MODE == 0 && t->transactionType != DATA_READ && t->nextCmd != ACTIVATE1_CMD &&
             t->nextCmd != ACTIVATE2_CMD && t->nextCmd != PRECHARGE_PB_CMD) {
         if (t->data_ready_cnt <= t->burst_length) {
             if (DEBUG_BUS) {
@@ -8564,17 +8687,20 @@ void MemoryController::lc(Transaction *t) {
     }
  
 
-    if (rw_group_state[0] != NO_GROUP && !t->timeout && t->issue_size == 0 && t->nextCmd != PRECHARGE_PB_CMD
+    uint8_t effective_rw_group = GetEffectiveRwGroup();
+    bool effective_in_write_group = rw_sync_group_valid ? rw_sync_in_write_group : in_write_group;
+    uint8_t effective_ch_cmd_cnt = rw_sync_group_valid ? rw_sync_ch_cmd_cnt : rwgrp_ch_cmd_cnt;
+    if (effective_rw_group != NO_GROUP && !t->timeout && t->issue_size == 0 && t->nextCmd != PRECHARGE_PB_CMD
             && !t->act_executing) {
-        if (rw_group_state[0] == READ_GROUP && t->transactionType != DATA_READ && (!LQOS_BP_EN || (lqos_rd_bp && LQOS_BP_EN))) {
-            if (t->nextCmd == activate_cmd || rwgrp_ch_cmd_cnt >= RW_GRPCHG_W2R_TH || !in_write_group) {
+        if (effective_rw_group == READ_GROUP && rw_schedulable_read_cnt != 0 && t->transactionType != DATA_READ && (!LQOS_BP_EN || (lqos_rd_bp && LQOS_BP_EN))) {
+            if (t->nextCmd == activate_cmd || effective_ch_cmd_cnt >= RW_GRPCHG_W2R_TH || !effective_in_write_group) {
                 if (DEBUG_BUS) {
                     PRINTN(setw(10)<<now()<<" -- LC :: Read group backpress a write command. task="
                             <<t->task<<", nextCmd="<<t->nextCmd<<endl);
                 }
                 return;
             }
-        } else if (rw_group_state[0] == READ_GROUP && t->transactionType == DATA_READ && RCMD_HQOS_RANK_SWITCH_EN) {
+        } else if (effective_rw_group == READ_GROUP && t->transactionType == DATA_READ && RCMD_HQOS_RANK_SWITCH_EN) {
             if ((t->nextCmd == READ_CMD || t->nextCmd == READ_P_CMD) && !rank_cmd_high_qos[t->rank] &&
                     ((unsigned)accumulate(rank_cmd_high_qos.begin(), rank_cmd_high_qos.end(), 0) >= 1)) {
                 if (DEBUG_BUS) {
@@ -8583,8 +8709,8 @@ void MemoryController::lc(Transaction *t) {
                 }
                 return;
             }
-        } else if (rw_group_state[0] == WRITE_GROUP && t->transactionType == DATA_READ && (!LQOS_BP_EN || (lqos_wr_bp && LQOS_BP_EN))) {
-            if (t->nextCmd == activate_cmd || rwgrp_ch_cmd_cnt >= RW_GRPCHG_R2W_TH || in_write_group) {
+        } else if (effective_rw_group == WRITE_GROUP && rw_schedulable_write_cnt != 0 && t->transactionType == DATA_READ && (!LQOS_BP_EN || (lqos_wr_bp && LQOS_BP_EN))) {
+            if (t->nextCmd == activate_cmd || effective_ch_cmd_cnt >= RW_GRPCHG_R2W_TH || effective_in_write_group) {
                 if (DEBUG_BUS) {
                     PRINTN(setw(10)<<now()<<" -- LC :: Write group backpress a read command. task="
                             <<t->task<<", nextCmd="<<t->nextCmd<<endl);
@@ -9066,12 +9192,12 @@ bool MemoryController::push_req(Transaction * trans) {
 
     if (DROP_WRITE_CMD && trans->transactionType != DATA_READ) {
         pos = true;
+    } else if ((RMW_ENABLE || WCMD_MERGE_EN) && !trans->pre_act) {
+        pos = rmw->addTransaction(trans);
     } else if (IECC_ENABLE && (!IECC_PARTIAL_BYPASS || trans->address < IECC_BYPASS_ADDRESS) && !trans->pre_act) {
         pos = iecc->addTransaction(trans);
     } else if (WRITE_BUFFER_ENABLE && !trans->pre_act) {
         pos = wb->addTransaction(trans);
-    } else if (RMW_ENABLE && !trans->pre_act) {
-        pos = rmw->addTransaction(trans);
     } else {
         pos = addTransaction(trans);
     }
@@ -9100,6 +9226,21 @@ bool MemoryController::push_req(Transaction * trans) {
         push_pending_TransactionQue(trans);
     }
     return pos;
+}
+
+bool MemoryController::push_after_rmw(Transaction *trans) {
+    if (IECC_ENABLE && (!IECC_PARTIAL_BYPASS || trans->address < IECC_BYPASS_ADDRESS)
+            && !trans->pre_act && !trans->ecc_flag) {
+        return iecc->addTransaction(trans);
+    }
+    return push_after_iecc(trans);
+}
+
+bool MemoryController::push_after_iecc(Transaction *trans) {
+    if (WRITE_BUFFER_ENABLE && !trans->pre_act) {
+        return wb->addTransaction(trans);
+    }
+    return addTransaction(trans);
 }
 
 void MemoryController::pushQosForSameMpamTrans(Transaction *trans) {
@@ -9133,11 +9274,34 @@ void MemoryController::noc_read_inform(bool fast_wakeup_rank0, bool fast_wakeup_
     }
 }
 
+bool MemoryController::refresh_backlog_blocks_external(const Transaction *trans) const {
+    if (trans == NULL) return false;
+    if (trans->ecc_flag || trans->pre_act) return false;
+    if (!AREF_EN && !PBR_EN) return false;
+    for (size_t rank = 0; rank < NUM_RANKS; rank++) {
+        for (size_t sc = 0; sc < sc_num; sc++) {
+            if (refreshALL[rank][sc].refresh_cnt >= 8) return true;
+        }
+    }
+    return false;
+}
+
 //allows outside source to make request of memory system
 bool MemoryController::addTransaction(Transaction *trans) {
     if (!full()) {
         auto &state = bankStates[trans->bankIndex];
         trans_state_init(trans);
+        if (trans->transactionType == DATA_WRITE) {
+            trans->data_ready_cnt = trans->burst_length + 1;
+        }
+
+        if (refresh_backlog_blocks_external(trans)) {
+            if (DEBUG_BUS) {
+                PRINTN(setw(10)<<now()<<" -- REFRESH_BACKLOG_BP :: task="<<trans->task
+                        <<" rank="<<trans->rank<<" bank="<<trans->bankIndex<<endl);
+            }
+            return false;
+        }
 
         // no e-mode : only 0 ; e-mode: upto subchannel
         unsigned sub_channel = (trans->bankIndex % NUM_BANKS) / sc_bank_num;
@@ -9295,6 +9459,22 @@ bool MemoryController::addTransaction(Transaction *trans) {
             }
         }
 
+        if (is_dmc_merge_pri_candidate(trans)) {
+            trans->pri++;
+            for (auto &t : transactionQueue) {
+                if (can_dmc_merge_pri_pair(trans, t)) {
+                    if (trans->pri > 0) trans->pri--;
+                    if (t->pri > 0) t->pri--;
+                    update_cmd_pri(CmdQueue, t->task, t->pri);
+                    break;
+                }
+            }
+            if (DEBUG_BUS) {
+                PRINTN(setw(10)<<now()<<" -- DMC_MERGE_PRI :: task="<<trans->task
+                        <<" pri="<<trans->pri<<" addr=0x"<<hex<<trans->address<<dec<<endl);
+            }
+        }
+
         for (auto &t : transactionQueue) {
             if (trans->task == t->task) {
                 ERROR(setw(10)<<now()<<" -- DMC["<<channel<<"] task:"<<trans->task<<", task duplication!");
@@ -9325,6 +9505,10 @@ bool MemoryController::addTransaction(Transaction *trans) {
         }
 
         transactionQueue.push_back(trans);
+        if (trans->transactionType == DATA_WRITE) {
+            wdata_order_queue.push_back(WdataOrderEntry(trans->task, trans->burst_length + 1));
+        }
+        update_cmd_pri(CmdQueue, trans->task, trans->pri);
 
 //        if (SLOT_FIFO) {
 //            transactionQueue.push_back(trans);
