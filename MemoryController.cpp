@@ -8629,8 +8629,18 @@ void MemoryController::lc(Transaction *t) {
         }
         return;
     }
-    if (RHIT_BREAK_EN && !t->timeout && bankStates[t->bankIndex].has_rhit_break && t->nextCmd != PRECHARGE_PB_CMD
-            && t->issue_size == 0 && !t->act_executing) {
+    bool has_other_row_candidate = false;
+    if (RHIT_BREAK_EN && bankStates[t->bankIndex].has_rhit_break) {
+        for (auto &other : transactionQueue) {
+            if (other == t || other->bankIndex != t->bankIndex || other->addrconf || other->pre_act
+                    || other->timeout || other->issue_size != 0 || other->row == t->row
+                    || now() < other->arb_time) continue;
+            has_other_row_candidate = true;
+            break;
+        }
+    }
+    if (RHIT_BREAK_EN && !t->timeout && bankStates[t->bankIndex].has_rhit_break && has_other_row_candidate
+            && t->nextCmd != PRECHARGE_PB_CMD && t->issue_size == 0 && !t->act_executing) {
         if (DEBUG_BUS) {
             PRINTN(setw(10)<<now()<<" -- LC :: rowhit break. bank="<<t->bankIndex<<" row="<<t->row<<" task="<<t->task<<endl);
         }
@@ -9291,9 +9301,6 @@ bool MemoryController::addTransaction(Transaction *trans) {
     if (!full()) {
         auto &state = bankStates[trans->bankIndex];
         trans_state_init(trans);
-        if (trans->transactionType == DATA_WRITE) {
-            trans->data_ready_cnt = trans->burst_length + 1;
-        }
 
         if (refresh_backlog_blocks_external(trans)) {
             if (DEBUG_BUS) {
