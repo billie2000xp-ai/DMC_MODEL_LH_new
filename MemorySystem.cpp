@@ -504,6 +504,9 @@ uint32_t MemorySystem::GetTransactionLen() {
 //    below interface for dmc write data
 //==============================================================================
 bool MemorySystem::addData(uint32_t *data ,uint64_t taskId, bool ecc_flag) {
+    if (ecc_flag) {
+        return submitData(data, taskId, true);
+    }
     if (RMW_ENABLE || WCMD_MERGE_EN) {
         return memoryController->rmw->addData(data, taskId);
     }
