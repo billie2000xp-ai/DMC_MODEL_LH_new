@@ -32,6 +32,8 @@ public:
     bool addTransaction(bool isWrite, uint64_t addr);
     void noc_read_inform(bool fast_wakeup_rank0, bool fast_wakeup_rank1, bool bus_rempty);
     bool addData(uint32_t *data ,uint64_t id, bool ecc_flag);
+    bool canAcceptData(uint64_t id) const;
+    bool submitData(uint32_t *data, uint64_t id, bool ecc_flag);
     bool addWriteDataPending(uint64_t task, unsigned remaining_beats, bool ecc_flag = false);
     bool WillAcceptTransaction();
     void RegisterCallbacks(Callback_t *readData, Callback_t *writeDone, Callback_t *readDone, Callback_t *cmdDone);
@@ -42,6 +44,8 @@ public:
     uint32_t getTransQueSize(bool isRd);
     bool hasPendingWork() const;
     void flushWriteMergeBuffer();
+    bool takeMergedWrite(uint64_t task, uint64_t &first_task);
+    void markMergedWrite(uint64_t task, uint64_t first_task);
     void dfs_backpress(bool backpress);
 //    void dfs_backpress(bool backpress) {memoryController->dfs_backpress(backpress);};
     //fields
@@ -243,6 +247,7 @@ private:
     vector<PendingWriteMergeResp> pending_write_merge_resps;
     vector<PendingWriteMergeData> pending_write_merge_datas;
     vector<WriteMergeDataRemap> write_merge_data_remaps;
+    std::map<uint64_t, uint64_t> merged_write_tasks;
     uint64_t next_write_merge_task;
     uint64_t pre_write_merge_resp_time;
     unsigned totalWriteMergeInput;
@@ -262,6 +267,7 @@ private:
     bool handle_write_merge_transaction(Transaction *trans);
     bool dispatch_write_merge_entry(size_t index, bool force_mask_wcmd);
     bool pump_write_merge_buffer();
+    bool has_paired_write_merge_entry();
     bool flush_one_write_merge_entry();
     void flush_all_write_merge_entries();
     bool remap_write_merge_data(uint32_t *data, uint64_t task);
@@ -270,6 +276,8 @@ private:
     void update_write_merge_resp();
     bool update_write_merge_data();
     bool write_merge_response(uint64_t task, uint8_t channel);
+    bool backend_locked;
+    uint64_t locked_task;
 };
 }
 #endif
