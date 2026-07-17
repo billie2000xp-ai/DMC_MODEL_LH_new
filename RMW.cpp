@@ -18,9 +18,12 @@ gCsQ5S8dHISlBFtDwNvcQ3yROkU5soXPnjDcr9UgAbT0+Kzk6UeRneIqMID/n+nQ8uUQOxnPDZfC
 #include "MemoryController.h"
 #include <assert.h>
 #include <iomanip>
+#include <algorithm>
 using namespace std;
 
 namespace LPDDRSim {
+Rmw::WriteMergeDataRemap::WriteMergeDataRemap(uint64_t src_task_, uint64_t dst_task_, unsigned remaining_beats_)
+        : src_task(src_task_), dst_task(dst_task_), remaining_beats(remaining_beats_) {}
 //#define PROTECT_SUB(a) a = (a > 0) ? (a - 1) : 0;
 
 //Rmw::Rmw(LPMemorySystemTop *_top, unsigned id, ostream &DDRSim_log_, string LogPath) :
@@ -36,6 +39,7 @@ Rmw::Rmw(MemoryController *_top, unsigned id, ostream &DDRSim_log_) :
     log_path = top->log_path;
     WdataToSend.clear();
     WdataChannel.clear();
+    wdata_order_queue.clear();
     pre_req_time = 0xFFFFFFFFFFFFFFFF;
     pre_req_data_time = 0xFFFFFFFFFFFFFFFF;
     pre_cresp_time = 0xFFFFFFFFFFFFFFFF;
@@ -215,27 +219,179 @@ bool Rmw::address_conf(Transaction *t, Transaction *cmd) {
 //    trans->has_active = false;
 //}
 
+bool Rmw::is_write_merge_candidate(const Transaction *trans) const {
+    if (trans == NULL || !WCMD_MERGE_EN || trans->transactionType != DATA_WRITE) return false;
+    if (!trans->mergeflag || trans->mask_wcmd || trans->ecc_flag) return false;
+    return ((trans->burst_length + 1) * DMC_DATA_BUS_BITS / 8) == 128;
+}
 
-//bool Rmw::addData(uint32_t *data, uint32_t channel, uint64_t task) {
-void Rmw::addData(uint32_t *data, uint64_t task) {
+bool Rmw::can_merge_write_pair(const Transaction *first, const Transaction *second) const {
+    if (!is_write_merge_candidate(first) || !is_write_merge_candidate(second)) return false;
+    uint64_t low_addr = std::min(first->address, second->address);
+    uint64_t high_addr = std::max(first->address, second->address);
+    return first->channel == second->channel && ((low_addr ^ high_addr) == 128) && ((low_addr & 127) == 0);
+}
 
-    pre_req_data_time = now();
-    
+Transaction *Rmw::build_merged_write_transaction(Transaction *first, Transaction *second, uint64_t merged_task, bool mask_wcmd) {
+    Transaction *lower = second != NULL && second->address < first->address ? second : first;
+    Transaction *merged = new Transaction(*lower);
+    merged->task = merged_task;
+    merged->address = lower->address & ~uint64_t(127);
+    merged->mask_wcmd = mask_wcmd;
+    merged->ecc_flag = false;
+    merged->burst_length = mask_wcmd ? ((first->burst_length + 1) * 2 - 1)
+            : ((first->burst_length + 1) + (second->burst_length + 1) - 1);
+    merged->data_size = (merged->burst_length + 1) * DMC_DATA_BUS_BITS / 8;
+    merged->data_ready_cnt = 0;
+    return merged;
+}
+
+bool Rmw::handle_write_merge_transaction(Transaction *trans) {
+    for (size_t i = 0; i < RmwQue.size(); i++) {
+        Transaction *first = RmwQue[i];
+        if (!can_merge_write_pair(first, trans)) continue;
+        unsigned first_beats = first->burst_length + 1;
+        unsigned second_ready = 0;
+        auto pending = pending_write_data_cnt.find(trans->task);
+        if (pending != pending_write_data_cnt.end()) {
+            second_ready = pending->second;
+            pending_write_data_cnt.erase(pending);
+        }
+        uint64_t first_task = first->task;
+        uint64_t second_task = trans->task;
+        Transaction *merged = build_merged_write_transaction(first, trans, second_task, false);
+        merged->data_ready_cnt = first->data_ready_cnt + second_ready;
+        merged->arb_time = now() + ((RMW_CONF_SIZE == 32) ? 3 : 2);
+        if (RMW_CMD_MODE == 2) {
+            bypassed_merged_writes.emplace(second_task, BypassedMergedWrite(first_task, second_task,
+                    first_beats - first->data_ready_cnt, trans->burst_length + 1 - second_ready));
+        } else if (first->data_ready_cnt < first_beats) {
+            write_merge_data_remaps.push_back(WriteMergeDataRemap(first_task, second_task,
+                    first_beats - first->data_ready_cnt));
+        }
+        write_merge_first_resp_task[second_task] = first_task;
+        delete first;
+        delete trans;
+        RmwQue[i] = merged;
+        RmwCmdState[i]->task = second_task;
+        RmwCmdState[i]->rmwTimeAdded = now();
+        RmwCmdState[i]->rmwState = QUE_WAITING;
+        rebuild_conflict_state();
+        return true;
+    }
+    bool rmw_que_full = rmw_cmd_cnt >= RMW_QUE_DEPTH && RMW_QUE_DEPTH != 0;
+    if (rmw_que_full) return false;
+    auto pending = pending_write_data_cnt.find(trans->task);
+    if (pending != pending_write_data_cnt.end()) {
+        trans->data_ready_cnt = std::min(pending->second, trans->burst_length + 1);
+        pending_write_data_cnt.erase(pending);
+    }
+    pre_req_time = now();
+    cmd_state *state = new cmd_state;
+    state->task = trans->task;
+    state->rmwTimeAdded = now();
+    trans->arb_time = now() + ((RMW_CONF_SIZE == 32) ? 3 : 2);
+    cmd_set_conflict(trans);
+    RmwQue.push_back(trans);
+    RmwCmdState.push_back(state);
+    rmw_cmd_cnt++;
+    wcmd_cnt++;
+    totalWrites++;
+    totalFullWrites++;
+    totalTransactions++;
+    return true;
+}
+
+void Rmw::rebuild_conflict_state() {
+    for (auto conf : RmwConfCnt) delete conf;
+    RmwConfCnt.clear();
+    for (size_t i = 0; i < RmwQue.size(); i++) {
+        conf_state *conf = new conf_state;
+        conf->task = RmwQue[i]->task;
+        for (size_t j = 0; j < i; j++) {
+            if (RmwQue[i]->channel == RmwQue[j]->channel
+                    && !(RmwQue[i]->transactionType == DATA_READ && RmwQue[j]->transactionType == DATA_READ)
+                    && address_conf(RmwQue[i], RmwQue[j])) conf->ad_conf_cnt++;
+        }
+        RmwConfCnt.push_back(conf);
+    }
+}
+
+bool Rmw::remap_write_merge_data(uint32_t *data, uint64_t task) {
+    for (auto it = bypassed_merged_writes.begin(); it != bypassed_merged_writes.end(); ++it) {
+        BypassedMergedWrite &entry = it->second;
+        bool first_source = task == entry.first_task && entry.first_remaining != 0;
+        bool second_source = task == entry.merged_task && entry.second_remaining != 0;
+        if (!first_source && !second_source) continue;
+        if (has_queued_write_data(entry.merged_task)) return false;
+        bool accepted = top->parentMemorySystem->submitData(data, entry.merged_task, false);
+        if (!accepted && top->canReceiveWdata(entry.merged_task)
+                && top->parentMemorySystem->write_map.count(entry.merged_task) == 0) {
+            top->receiveFromCPU(data, entry.merged_task);
+            accepted = true;
+        }
+        if (!accepted) {
+            return false;
+        }
+        check_write_data(entry.merged_task);
+        if (first_source) entry.first_remaining--;
+        else entry.second_remaining--;
+        if (entry.first_remaining == 0 && entry.second_remaining == 0) {
+            bypassed_merged_writes.erase(it);
+        }
+        pre_req_data_time = now();
+        return true;
+    }
+    for (size_t i = 0; i < write_merge_data_remaps.size(); i++) {
+        if (write_merge_data_remaps[i].src_task != task) continue;
+        uint64_t dst_task = write_merge_data_remaps[i].dst_task;
+        if (!top->parentMemorySystem->submitData(data, dst_task, false)) return false;
+        check_write_data(dst_task);
+        write_merge_data_remaps[i].remaining_beats--;
+        if (write_merge_data_remaps[i].remaining_beats == 0) {
+            write_merge_data_remaps.erase(write_merge_data_remaps.begin() + i);
+        }
+        pre_req_data_time = now();
+        return true;
+    }
+    return false;
+}
+
+bool Rmw::has_queued_write_data(uint64_t task) const {
+    return std::find(WdataToSend.begin(), WdataToSend.end(), task) != WdataToSend.end();
+}
+
+bool Rmw::is_unpaired_write_merge_timeout(Transaction *trans, cmd_state *state) {
+    return is_write_merge_candidate(trans) && WRITE_MERGE_TIMEOUT != 0
+            && now() - state->rmwTimeAdded >= WRITE_MERGE_TIMEOUT;
+}
+
+bool Rmw::addData(uint32_t *data, uint64_t task) {
+    if (remap_write_merge_data(data, task)) return true;
+    auto fast_bypass = fast_bypass_write_data_cnt.find(task);
+    if (fast_bypass != fast_bypass_write_data_cnt.end()) {
+        if (has_queued_write_data(task)) return false;
+        if (!top->parentMemorySystem->submitData(data, task, false)) return false;
+        check_write_data(task);
+        if (--fast_bypass->second == 0) fast_bypass_write_data_cnt.erase(fast_bypass);
+        pre_req_data_time = now();
+        return true;
+    }
     bool task_match = false;
     for (auto &rmwq : RmwQue) {
         if (task == rmwq->task) {
             task_match=true;
         };
-        if ((((rmwq->transactionType == DATA_WRITE)&&(rmwq->mask_wcmd==true)) || ((rmwq->transactionType == DATA_WRITE)&&(RMW_CMD_MODE==1)&&(rmwq->mask_wcmd==false))
-                || ((rmwq->transactionType == DATA_WRITE)&&(rmwq->mask_wcmd==false)&&(rmwq->ecc_flag==true)))  // ecc full_write, must collect all data
+        if (rmwq->transactionType == DATA_WRITE
                 && rmwq->data_ready_cnt <= rmwq->burst_length && task==rmwq->task) {
             rmwq->data_ready_cnt ++;
+            pre_req_data_time = now();
             if (DEBUG_BUS) {
                  PRINTN(setw(10)<<now()<<" -- RMW_MATCH :: data_ready_cnt:"<<rmwq->data_ready_cnt
                          <<", data_size="<<rmwq->data_size<<", task="<<rmwq->task<<endl);
             }
 //            return true;
-            break;
+            return true;
         }
     }
 
@@ -249,13 +405,48 @@ void Rmw::addData(uint32_t *data, uint64_t task) {
 //        } else {
 //            ret = top->channels[channel]->addData(data ,task);
 //        }
-        top->receiveFromCPU(data ,task);
-//        return ret;
+        if (top->parentMemorySystem->write_map.count(task) != 0) {
+            return top->parentMemorySystem->submitData(data, task, false);
+        }
+        if (WCMD_MERGE_EN) {
+            pending_write_data_cnt[task]++;
+            pre_req_data_time = now();
+            return true;
+        }
+        return top->parentMemorySystem->submitData(data, task, false);
     }
 
 //    ERROR(setw(10)<<now()<<" -- Impossible wdata, task="<<task);
 //    assert(0);
 
+    return true;
+}
+
+bool Rmw::canAcceptData(uint64_t task) const {
+    if (fast_bypass_write_data_cnt.find(task) != fast_bypass_write_data_cnt.end()) {
+        return !has_queued_write_data(task) && top->canReceiveWdata(task);
+    }
+    for (const auto &item : bypassed_merged_writes) {
+        const BypassedMergedWrite &entry = item.second;
+        if ((task == entry.first_task && entry.first_remaining != 0)
+                || (task == entry.merged_task && entry.second_remaining != 0)) {
+            return !has_queued_write_data(entry.merged_task) && top->canReceiveWdata(entry.merged_task);
+        }
+    }
+    for (const auto &entry : write_merge_data_remaps) {
+        if (entry.src_task == task) return top->canReceiveWdata(entry.dst_task);
+    }
+    for (auto rmwq : RmwQue) {
+        if (rmwq->task == task && rmwq->transactionType == DATA_WRITE
+                && rmwq->data_ready_cnt <= rmwq->burst_length) {
+            return true;
+        }
+    }
+    if (top->parentMemorySystem->write_map.count(task) != 0) {
+        return top->canReceiveWdata(task);
+    }
+    if (WCMD_MERGE_EN) return true;
+    return top->canReceiveWdata(task);
 }
 
 bool Rmw::addTransaction(Transaction * trans) {
@@ -274,6 +465,10 @@ bool Rmw::addTransaction(Transaction * trans) {
 //    uint8_t ch = trans->channel;
     bool rmw_que_full  = rmw_cmd_cnt >= RMW_QUE_DEPTH && RMW_QUE_DEPTH != 0;
     bool rmw_que_empty = rmw_cmd_cnt == 0;
+
+    if (is_write_merge_candidate(trans)) {
+        return handle_write_merge_transaction(trans);
+    }
 
     if (rmw_que_full) {
         if (DEBUG_BUS) {
@@ -295,7 +490,7 @@ bool Rmw::addTransaction(Transaction * trans) {
             }
 
 //            bool ret = top->channels[ch]->addTransaction(trans); 
-            bool ret = top->addTransaction(trans); 
+            bool ret = top->push_after_rmw(trans); 
             
             if (ret) {
                 if (trans->transactionType==DATA_READ){
@@ -340,6 +535,12 @@ bool Rmw::addTransaction(Transaction * trans) {
         return true;
     } else {
         cmd_set_conflict(trans);
+        auto pending = pending_write_data_cnt.find(trans->task);
+        if (pending != pending_write_data_cnt.end()) {
+            unsigned beats = trans->burst_length + 1;
+            trans->data_ready_cnt += std::min(pending->second, beats - trans->data_ready_cnt);
+            pending_write_data_cnt.erase(pending);
+        }
         if (RMW_CONF_SIZE == 32) {
             trans->arb_time = now() + 3;
         } else {
@@ -522,6 +723,18 @@ void Rmw::sch_que() {
                 RmwCmdState[i]->rmwState = SEND_READY;   
             }
         }
+        if (RmwQue[i]->transactionType == DATA_WRITE && !RmwQue[i]->mask_wcmd
+                && is_write_merge_candidate(RmwQue[i])
+                && is_unpaired_write_merge_timeout(RmwQue[i], RmwCmdState[i])) {
+            if (UNPAIRED_TO_RMW_EN) {
+                RmwQue[i]->mask_wcmd = true;
+                RmwQue[i]->burst_length = (RmwQue[i]->burst_length + 1) * 2 - 1;
+                RmwQue[i]->data_size = (RmwQue[i]->burst_length + 1) * DMC_DATA_BUS_BITS / 8;
+                top->rmw_rd_finish[RmwQue[i]->task] = false;
+            } else if (RmwQue[i]->data_ready_cnt >= RmwQue[i]->burst_length + 1) {
+                RmwCmdState[i]->rmwState = SEND_READY;
+            }
+        }
     }
 }
 
@@ -548,6 +761,12 @@ void Rmw::arb_node() {
         if ((RmwCmdState[i]-> rmwState == MERGE_READ)&&(RmwQue[i]->mask_wcmd==true)) {
             continue;
         }
+        bool merged_command = write_merge_first_resp_task.find(RmwQue[i]->task)
+                != write_merge_first_resp_task.end();
+        if (is_write_merge_candidate(RmwQue[i]) && !merged_command
+                && RmwCmdState[i]->rmwState != SEND_READY) {
+            continue;
+        }
         if ((RmwQue[i]->transactionType == DATA_WRITE)&&(RmwQue[i]->mask_wcmd==false)&&(RMW_CMD_MODE==1)&&(RmwCmdState[i]-> rmwState!=SEND_READY)) {
             continue;
         }
@@ -562,7 +781,7 @@ void Rmw::arb_node() {
             Transaction *trans = new Transaction(RmwQue[i]);
             trans->transactionType = DATA_READ; 
 //            if (top->channels[ch]->addTransaction(trans)) {
-            if (top->addTransaction(trans)) {
+            if (top->push_after_rmw(trans)) {
                 if (DEBUG_BUS) {
                     PRINTN(setw(10)<<now()<<" -- RMW SCH :: [MERGE_READ_CMD] task="<<RmwQue[i]->task<<" type="<<RmwQue[i]->transactionType<<" mask_write="<<RmwQue[i]->mask_wcmd<<" ecc_flag="<<RmwQue[i]->ecc_flag
                             <<" qos="<<RmwQue[i]->qos<<" burst_length="<<RmwQue[i]->burst_length<<" channel="<<RmwQue[i]->channel<<" data_ready_cnt="<<RmwQue[i]->data_ready_cnt<<" address="<<hex<<RmwQue[i]->address
@@ -579,7 +798,7 @@ void Rmw::arb_node() {
                     || ((RmwQue[i]->transactionType == DATA_WRITE)&&(RmwQue[i]->mask_wcmd==false)&&(RmwQue[i]->ecc_flag==true)&&(RmwCmdState[i]->rmwState==SEND_READY))  // full write cmd with ecc flag
                     || ((RmwQue[i]->transactionType == DATA_WRITE)&&(RmwQue[i]->mask_wcmd==true)&&(RmwCmdState[i]->rmwState==SEND_READY))) {     // mask write cmd
 //            if (top->channels[ch]->addTransaction(RmwQue[i])) {
-            if (top->addTransaction(RmwQue[i])) {
+            if (top->push_after_rmw(RmwQue[i])) {
                 if (DEBUG_BUS) {
                     PRINTN(setw(10)<<now()<<" -- RMW SCH :: task="<<RmwQue[i]->task<<" type="<<RmwQue[i]->transactionType<<" mask_write="<<RmwQue[i]->mask_wcmd<<" ecc_flag="<<RmwQue[i]->ecc_flag 
                             <<" qos="<<RmwQue[i]->qos<<" burst_length="<<RmwQue[i]->burst_length<<" channel="<<RmwQue[i]->channel<<" data_ready_cnt="<<RmwQue[i]->data_ready_cnt<<" address="<<hex<<RmwQue[i]->address
@@ -589,6 +808,7 @@ void Rmw::arb_node() {
 
                 // collect all wdata for sended write cmd
                 if ((RmwQue[i]->transactionType==DATA_WRITE) && ((RmwQue[i]->mask_wcmd==true || (RmwQue[i]->mask_wcmd==false && RMW_CMD_MODE==1) || (!RmwQue[i]->mask_wcmd && RmwQue[i]->ecc_flag)))) {
+                    track_write_command(RmwQue[i]->task, RmwQue[i]->burst_length + 1);
                     for (size_t j = 0; j <= RmwQue[i]->burst_length; j++) {
                         WdataToSend.push_back(RmwQue[i]->task);
                         WdataChannel.push_back(ch);
@@ -612,9 +832,31 @@ void Rmw::arb_node() {
                 RmwQue.erase(RmwQue.begin() + i);
                 break;
             }
-        } else if ((RmwQue[i]->transactionType == DATA_WRITE)&&(RmwQue[i]->mask_wcmd==false)&&(RMW_CMD_MODE==0)) {     // full write cmd under fast cmd mode
+        } else if ((RmwQue[i]->transactionType == DATA_WRITE)&&(RmwQue[i]->mask_wcmd==false)
+                && ((RMW_CMD_MODE==0) || (RMW_CMD_MODE==2 && !RmwQue[i]->ecc_flag))) {
 //            if (top->channels[ch]->addTransaction(RmwQue[i])) {
-            if (top->addTransaction(RmwQue[i])) {
+            unsigned buffered_beats = RmwQue[i]->data_ready_cnt;
+            bool merged_command_first = merged_command && RMW_CMD_MODE == 2;
+            if (top->push_after_rmw(RmwQue[i])) {
+                uint64_t task = RmwQue[i]->task;
+                unsigned total_beats = RmwQue[i]->burst_length + 1;
+                track_write_command(task, total_beats);
+                for (unsigned j = 0; j < buffered_beats; j++) {
+                    WdataToSend.push_back(task);
+                    WdataChannel.push_back(ch);
+                }
+                if (buffered_beats < total_beats && !merged_command_first) {
+                    fast_bypass_write_data_cnt[task] = total_beats - buffered_beats;
+                }
+                if (merged_command) {
+                    top->parentMemorySystem->markMergedWrite(
+                            task, write_merge_first_resp_task[task]);
+                    write_merge_first_resp_task.erase(task);
+                }
+                auto bypassed = bypassed_merged_writes.find(task);
+                if (bypassed != bypassed_merged_writes.end()) {
+                    bypassed->second.dispatched = true;
+                }
                 if (DEBUG_BUS) {
                     PRINTN(setw(10)<<now()<<" -- RMW SCH :: task="<<RmwQue[i]->task<<" type="<<RmwQue[i]->transactionType<<" mask_write="<<RmwQue[i]->mask_wcmd<<" ecc_flag="<<RmwQue[i]->ecc_flag 
                             <<" qos="<<RmwQue[i]->qos<<" burst_length="<<RmwQue[i]->burst_length<<" channel="<<RmwQue[i]->channel<<" data_ready_cnt="<<RmwQue[i]->data_ready_cnt<<" address="<<hex<<RmwQue[i]->address
@@ -656,12 +898,12 @@ void Rmw::send_wdata() {
         if (DEBUG_BUS) {
             PRINTN(setw(10)<<now()<<" -- RMW_SEND_WDATA :: task="<<WdataToSend[0]<<" channel="<<WdataChannel[0]<<endl);
         }
-        top->receiveFromCPU(0, WdataToSend[0]);
-//        bool ret = top->channels[WdataChannel[0]]->addData(0, WdataToSend[0]);
-//        if (ret) {
-        WdataToSend.erase(WdataToSend.begin());
-        WdataChannel.erase(WdataChannel.begin());
-//        }
+        uint64_t task = WdataToSend[0];
+        if (top->parentMemorySystem->submitData(NULL, task, false)) {
+            check_write_data(task);
+            WdataToSend.erase(WdataToSend.begin());
+            WdataChannel.erase(WdataChannel.begin());
+        }
     }
 }
 
@@ -812,5 +1054,34 @@ void Rmw::check_cnt() {
 //    STATE_PRINTN("========================================= END =========================================\n");
 //    STATE_PRINTN("\n");
 //}
+
+void Rmw::track_write_command(uint64_t task, unsigned beats) {
+    if (beats != 0) wdata_order_queue.push_back(WdataOrderEntry(task, beats));
+}
+
+void Rmw::check_write_data(uint64_t task) {
+    if (wdata_order_queue.empty() || wdata_order_queue.front().task != task) {
+        ERROR(setw(10)<<now()<<" -- RMW WDATA ORDER ERROR :: actual_task="<<task
+                <<" expected_task="<<(wdata_order_queue.empty() ? 0xffffffffffffffffull : wdata_order_queue.front().task));
+        assert(0);
+    }
+    if (--wdata_order_queue.front().remaining_beats == 0) wdata_order_queue.erase(wdata_order_queue.begin());
+}
+
+bool Rmw::hasPendingWork() const {
+    return !WdataToSend.empty() || !RmwQue.empty() || !pending_write_data_cnt.empty()
+            || !write_merge_data_remaps.empty() || !fast_bypass_write_data_cnt.empty()
+            || !bypassed_merged_writes.empty() || !wdata_order_queue.empty();
+}
+
+bool Rmw::flushWriteMergeBuffer() {
+    for (size_t i = 0; i < RmwQue.size(); i++) {
+        if (is_write_merge_candidate(RmwQue[i])) {
+            RmwCmdState[i]->rmwState = SEND_READY;
+            return true;
+        }
+    }
+    return false;
+}
 
 }
