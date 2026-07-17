@@ -158,6 +158,7 @@ struct hha_command {
     uint32_t rank;
     uint32_t sc;
     uint32_t bank;
+    uint32_t bankIndex;
     uint32_t row;
     uint32_t col;
     uint32_t channel;
@@ -194,6 +195,7 @@ struct hha_command {
         rank = 0;
         sc = 0;
         bank = 0;
+        bankIndex = 0;
         row = 0;
         col = 0;
         channel = 0;
