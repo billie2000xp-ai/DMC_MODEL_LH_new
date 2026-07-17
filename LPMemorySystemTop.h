@@ -46,8 +46,11 @@ public:
     void update();
     void RegisterCallbacks(TransactionCompleteCB *readData,
             TransactionCompleteCB *writeDone,TransactionCompleteCB *readDone, TransactionCompleteCB *cmdDone);
+    void RegisterCallbacks(TransactionCompleteCB *readData,
+            WriteTransactionCompleteCB *writeDone,TransactionCompleteCB *readDone, TransactionCompleteCB *cmdDone);
     void InitOutputFiles();
     bool addData(uint32_t *data,uint32_t channel,uint64_t id);
+    bool canAcceptData(uint32_t channel, uint64_t id) const;
     void read_complete(unsigned id, uint64_t address, uint64_t clk);
     void write_complete(unsigned id, uint64_t address, uint64_t clk);
     void register_read(uint64_t address ,uint32_t &data);
@@ -87,11 +90,22 @@ public:
 //    Rmw *rmw;
 
 private:
+    bool rw_sync_group_valid;
+    uint8_t rw_sync_group;
+    vector<uint8_t> rw_sync_group_state;
+    bool rw_sync_in_write_group;
+    unsigned rw_sync_serial_cmd_cnt;
+    unsigned rw_sync_reverse_cmd_cnt;
+    unsigned rw_sync_rw_cmd_num;
+    unsigned rw_sync_act_cmd_num;
+    vector<MemoryController::RwGroupSnapshot> rw_sync_prev_snapshot;
+    void update_rw_sync_group();
     vector <hha_command> CommandDelay;
     string IniFilename;
 
     TransactionCompleteCB *read_cb;
     TransactionCompleteCB *write_cb;
+    WriteTransactionCompleteCB *extended_write_cb;
     TransactionCompleteCB *read_done_cb;
     TransactionCompleteCB *cmd_done_cb;
     struct TopRespPacket {
@@ -100,6 +114,8 @@ private:
         double readDataEnterDmcTime;
         double reqAddToDmcTime;
         double reqEnterDmcBufTime;
+        bool merge_flag;
+        uint64_t first_task;
     };
     std::map<uint64_t, unsigned> expected_read_beats_map;
     std::deque<TopRespPacket> top_rdata_fifo;
