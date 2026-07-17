@@ -208,27 +208,6 @@ private:
     vector <vector<unsigned>> pre_abr_cnt;
     vector <unsigned> pre_pbr_cnt;
 
-    struct WriteMergeEntry {
-        Transaction *first_trans;
-        Transaction *second_trans;
-        unsigned first_data_ready_cnt;
-        unsigned second_data_ready_cnt;
-        bool has_second;
-        bool paired_tail;
-        bool task_allocated;
-        uint64_t merged_task;
-        uint64_t enqueue_time;
-        uint8_t upstream_channel;
-        WriteMergeEntry();
-    };
-
-    struct PendingWriteMergeResp {
-        uint64_t task;
-        uint8_t channel;
-        uint64_t wait_data_task;
-        PendingWriteMergeResp(uint64_t task_, uint8_t channel_, uint64_t wait_data_task_ = 0xffffffffffffffffull);
-    };
-
     struct PendingWriteMergeData {
         uint64_t task;
         unsigned remaining_beats;
@@ -236,46 +215,9 @@ private:
         PendingWriteMergeData(uint64_t task_, unsigned remaining_beats_, bool ecc_flag_ = false);
     };
 
-    struct WriteMergeDataRemap {
-        uint64_t src_task;
-        uint64_t dst_task;
-        unsigned remaining_beats;
-        WriteMergeDataRemap(uint64_t src_task_, uint64_t dst_task_, unsigned remaining_beats_);
-    };
-
-    vector<WriteMergeEntry> write_merge_buffer;
-    vector<PendingWriteMergeResp> pending_write_merge_resps;
     vector<PendingWriteMergeData> pending_write_merge_datas;
-    vector<WriteMergeDataRemap> write_merge_data_remaps;
     std::map<uint64_t, uint64_t> merged_write_tasks;
-    uint64_t next_write_merge_task;
-    uint64_t pre_write_merge_resp_time;
-    unsigned totalWriteMergeInput;
-    unsigned totalWriteMergePair;
-    unsigned totalWriteMergeUnpairedToRmw;
-    unsigned totalWriteMergeUnpairedDirect;
-    unsigned totalWriteMergeBufferFull;
-    unsigned preWriteMergeInput;
-    unsigned preWriteMergePair;
-    unsigned preWriteMergeUnpairedToRmw;
-    unsigned preWriteMergeUnpairedDirect;
-    unsigned preWriteMergeBufferFull;
-
-    bool is_write_merge_candidate(const Transaction *trans) const;
-    bool can_merge_write_pair(const Transaction *first, const Transaction *second) const;
-    Transaction *build_merged_write_transaction(WriteMergeEntry &entry, uint64_t merged_task, bool mask_wcmd);
-    bool handle_write_merge_transaction(Transaction *trans);
-    bool dispatch_write_merge_entry(size_t index, bool force_mask_wcmd);
-    bool pump_write_merge_buffer();
-    bool has_paired_write_merge_entry();
-    bool flush_one_write_merge_entry();
-    void flush_all_write_merge_entries();
-    bool remap_write_merge_data(uint32_t *data, uint64_t task);
-    bool is_write_merge_data_task(uint64_t task) const;
-    bool add_write_merge_data(uint32_t *data, uint64_t task);
-    void update_write_merge_resp();
     bool update_write_merge_data();
-    bool write_merge_response(uint64_t task, uint8_t channel);
     bool backend_locked;
     uint64_t locked_task;
 };
