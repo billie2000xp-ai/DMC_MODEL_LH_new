@@ -326,20 +326,6 @@ void Rmw::rebuild_conflict_state() {
 }
 
 bool Rmw::remap_write_merge_data(uint32_t *data, uint64_t task) {
-    // #region debug-point H5:rmw-data-ownership
-    if (task == 1132) {
-        std::ostringstream dbg_payload;
-        dbg_payload << "{\"sessionId\":\"trace-l06-timeout\",\"runId\":\"pre-fix\",\"hypothesisId\":\"H5\",\"location\":\"Rmw::remap_write_merge_data\",\"msg\":\"[DEBUG] task data ownership lookup\",\"data\":{\"now\":" << now() << ",\"task\":" << task << ",\"bypassedMergedWrites\":" << bypassed_merged_writes.size() << ",\"remaps\":" << write_merge_data_remaps.size() << ",\"pendingData\":" << pending_write_data_cnt.size() << ",\"queuedData\":" << WdataToSend.size() << "}}";
-        std::string dbg_json = dbg_payload.str();
-        size_t dbg_quote = 0;
-        while ((dbg_quote = dbg_json.find('"', dbg_quote)) != std::string::npos) {
-            dbg_json.insert(dbg_quote, 1, '\\');
-            dbg_quote += 2;
-        }
-        std::string dbg_command = "curl.exe -s -X POST http://127.0.0.1:7778/event -H \"Content-Type: application/json\" -d \"" + dbg_json + "\" > NUL";
-        std::system(dbg_command.c_str());
-    }
-    // #endregion
     for (auto it = bypassed_merged_writes.begin(); it != bypassed_merged_writes.end(); ++it) {
         BypassedMergedWrite &entry = it->second;
         bool first_source = task == entry.first_task && entry.first_remaining != 0;
@@ -403,20 +389,6 @@ bool Rmw::is_unpaired_write_merge_timeout(Transaction *trans, cmd_state *state) 
 }
 
 bool Rmw::addData(uint32_t *data, uint64_t task) {
-    // #region debug-point H5:rmw-add-data
-    if (task == 1132) {
-        std::ostringstream dbg_payload;
-        dbg_payload << "{\"sessionId\":\"trace-l06-timeout\",\"runId\":\"pre-fix\",\"hypothesisId\":\"H5\",\"location\":\"Rmw::addData\",\"msg\":\"[DEBUG] task data add\",\"data\":{\"now\":" << now() << ",\"task\":" << task << ",\"rmwQueue\":" << RmwQue.size() << ",\"queuedData\":" << WdataToSend.size() << ",\"writeMap\":" << top->parentMemorySystem->write_map.size() << "}}";
-        std::string dbg_json = dbg_payload.str();
-        size_t dbg_quote = 0;
-        while ((dbg_quote = dbg_json.find('"', dbg_quote)) != std::string::npos) {
-            dbg_json.insert(dbg_quote, 1, '\\');
-            dbg_quote += 2;
-        }
-        std::string dbg_command = "curl.exe -s -X POST http://127.0.0.1:7778/event -H \"Content-Type: application/json\" -d \"" + dbg_json + "\" > NUL";
-        std::system(dbg_command.c_str());
-    }
-    // #endregion
     if (remap_write_merge_data(data, task)) return true;
     auto fast_bypass = fast_bypass_write_data_cnt.find(task);
     if (fast_bypass != fast_bypass_write_data_cnt.end()) {
@@ -875,7 +847,8 @@ void Rmw::arb_node() {
                     || ((RmwQue[i]->transactionType == DATA_WRITE)&&(RmwQue[i]->mask_wcmd==false)&&(RmwQue[i]->ecc_flag==true)&&(RmwCmdState[i]->rmwState==SEND_READY))  // full write cmd with ecc flag
                     || ((RmwQue[i]->transactionType == DATA_WRITE)&&(RmwQue[i]->mask_wcmd==true)&&(RmwCmdState[i]->rmwState==SEND_READY))) {     // mask write cmd
 //            if (top->channels[ch]->addTransaction(RmwQue[i])) {
-            if (top->push_after_rmw(RmwQue[i])) {
+            bool push_ret = top->push_after_rmw(RmwQue[i]);
+            if (push_ret) {
                 if (DEBUG_BUS) {
                     PRINTN(setw(10)<<now()<<" -- RMW SCH :: task="<<RmwQue[i]->task<<" type="<<RmwQue[i]->transactionType<<" mask_write="<<RmwQue[i]->mask_wcmd<<" ecc_flag="<<RmwQue[i]->ecc_flag 
                             <<" qos="<<RmwQue[i]->qos<<" burst_length="<<RmwQue[i]->burst_length<<" channel="<<RmwQue[i]->channel<<" data_ready_cnt="<<RmwQue[i]->data_ready_cnt<<" address="<<hex<<RmwQue[i]->address
@@ -982,7 +955,8 @@ void Rmw::send_wdata() {
             PRINTN(setw(10)<<now()<<" -- RMW_SEND_WDATA :: task="<<WdataToSend[0]<<" channel="<<WdataChannel[0]<<endl);
         }
         uint64_t task = WdataToSend[0];
-        if (top->parentMemorySystem->submitData(NULL, task, false)) {
+        bool submit_ret = top->parentMemorySystem->submitData(NULL, task, false);
+        if (submit_ret) {
             check_write_data(task);
             WdataToSend.erase(WdataToSend.begin());
             WdataChannel.erase(WdataChannel.begin());
