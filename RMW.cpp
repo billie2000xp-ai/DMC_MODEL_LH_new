@@ -69,6 +69,7 @@ Rmw::Rmw(MemoryController *_top, unsigned id, ostream &DDRSim_log_) :
 
     }
 
+
 //void WriteBuff::rcmd_push_wcmd(Transaction * t) {
 //    for (auto &w : Wbuff) {
 //        if (t->bankIndex == w->bankIndex && t->row == w->row && t->col == w->col) {
