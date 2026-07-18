@@ -211,7 +211,7 @@ MemorySystem::MemorySystem(unsigned dmcId,unsigned hhaId, ostream &DDRSim_log_,s
 
 //==============================================================================
 void MemorySystem::InitOutputFiles() {
-    if ((DEBUG_BUS || DEBUG_STATE || DEBUG_GBUF_STATE || DEBUG_RMW_STATE) && (channel_ohot == (channel_ohot & PRINT_CH_OHOT))) {
+    if ((DEBUG_BUS || DEBUG_STATE || DEBUG_GBUF_STATE || DEBUG_RMW_STATE)) {
         dmc_log = log_path + "/lpddr_sim" + std::to_string(channel) + ".log";
         DDRSim_log.open(dmc_log.c_str(),ios_base::out | ios_base::trunc);
         if (!DDRSim_log) {
@@ -544,7 +544,7 @@ bool MemorySystem::submitData(uint32_t *data, uint64_t taskId, bool ecc_flag) {
         //     }
             
         // one cycle one data check
-        if (memoryController->pre_req_data_time == memoryController->now() || (RMW_ENABLE && memoryController->rmw->pre_req_data_time == memoryController->rmw->now()) ) {
+        if (memoryController->pre_req_data_time == memoryController->now()) {
             return false;
         }
         if (RMW_ENABLE) {
