@@ -7200,7 +7200,7 @@ void MemoryController::update_que() {
         } else {
             w_rank_cnt[t->rank] --;
             w_rank_bst[t->rank] -= ceil(float(t->data_size) / max_bl_data_size);
-            if (!IECC_ENABLE || !tasks_info[t->task].wr_ecc) {
+            if (!t->ecc_flag && (!IECC_ENABLE || !tasks_info[t->task].wr_ecc)) {
                 gen_wresp(t->task);
             }
             que_write_cnt --;
