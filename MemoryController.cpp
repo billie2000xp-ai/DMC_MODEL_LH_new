@@ -6735,8 +6735,7 @@ void MemoryController::update_group_state() {
             continue;
         if (trans->transactionType == DATA_READ) {
             has_rd_cmd[trans->rank] = true;
-        } else if (WCMD_DATA_READY_MODE == 1 ||
-                trans->data_ready_cnt == (trans->burst_length + 1)) {
+        } else if (trans->data_ready_cnt == (trans->burst_length + 1)) {
             has_wr_cmd[trans->rank] = true;
         }
     }
@@ -6927,8 +6926,7 @@ void MemoryController::update_rw_schedulable_counts() {
         if (trans->bp_by_tout) continue;
         if (trans->transactionType == DATA_READ) {
             rw_schedulable_read_cnt++;
-        } else if (WCMD_DATA_READY_MODE == 1 ||
-                trans->data_ready_cnt == (trans->burst_length + 1)) {
+        } else if (trans->data_ready_cnt == (trans->burst_length + 1)) {
             rw_schedulable_write_cnt++;
         }
     }
@@ -7154,7 +7152,7 @@ void MemoryController::update_que() {
 //        unsigned bank_start = sub_channel * NUM_BANKS /sc_num;
 //        unsigned bank_pair_start = sub_channel * pbr_bank_num;
         if (t->issue_size < t->data_size) continue;
-        if (WCMD_DATA_READY_MODE == 1 && t->transactionType == DATA_WRITE &&
+        if (t->transactionType == DATA_WRITE &&
                 t->data_ready_cnt <= t->burst_length) continue;
         if (t->issue_size > t->data_size) {
             ERROR(setw(10)<<now()<<" -- Error issue_size, task="<<t->task<<" data_size="
@@ -8262,7 +8260,7 @@ void MemoryController::check_timeout_and_aging() {
     // generate original timeout flag
     for (auto &trans : transactionQueue) {
         if (now() < trans->arb_time) continue;
-        if (WCMD_DATA_READY_MODE == 0 && trans->transactionType == DATA_WRITE &&
+        if (trans->transactionType == DATA_WRITE &&
                 trans->data_ready_cnt <= trans->burst_length) continue;
         if (trans->addrconf) continue;
         if (!trans->timeout && ((now() - trans->timeAdded >= trans->timeout_th &&
@@ -8663,7 +8661,7 @@ void MemoryController::lc(Transaction *t) {
         return;
     }
 
-    if (WCMD_DATA_READY_MODE == 0 && t->transactionType != DATA_READ && t->nextCmd != ACTIVATE1_CMD &&
+    if (t->transactionType != DATA_READ && t->nextCmd != ACTIVATE1_CMD &&
             t->nextCmd != ACTIVATE2_CMD && t->nextCmd != PRECHARGE_PB_CMD) {
         if (t->data_ready_cnt <= t->burst_length) {
             if (DEBUG_BUS) {
