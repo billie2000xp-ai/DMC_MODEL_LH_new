@@ -45,6 +45,7 @@ struct ECC_BUF_Entry {
 
     uint32_t ecc_pri;//replace priority
     uint32_t wr_merge_cnt;//24/9/6
+    uint32_t wr_hit_cnt;
     
 
     BUF_STATE buf_ctrl_state;
@@ -95,6 +96,10 @@ class Inline_ECC:public SimulatorObject {
     uint32_t try_count;
     uint32_t rhit;
     uint32_t whit;
+    uint64_t pdu_read_query_count;
+    uint64_t pdu_read_hit_count;
+    uint64_t pdu_write_query_count;
+    uint64_t pdu_write_hit_count;
     uint32_t merge_cnt;
     uint32_t merge_id;
     uint32_t wpos[17];
@@ -104,6 +109,7 @@ class Inline_ECC:public SimulatorObject {
     ECC_MODEL_STATE ecc_pre_state;
     Transaction *pdu_push_pending_trans;
     uint32_t pdu_push_pending_wr_ecc_buf_id;
+    bool current_wr_pdu_hit;
     bool iecc_owner_valid;
     uint64_t iecc_owner_task;
     uint64_t iecc_owner_address;
