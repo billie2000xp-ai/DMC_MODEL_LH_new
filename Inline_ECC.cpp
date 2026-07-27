@@ -33,10 +33,12 @@ Inline_ECC::Inline_ECC(MemoryController *_top,unsigned id, ostream &DDRSim_log_)
     top(_top),channel(id),DDRSim_log(DDRSim_log_) {
     channel_ohot = 1ull << channel;
     rd_ecc_buf.clear();
-    wr_ecc_buf.reserve(PDU_DEPTH);
+    wr_ecc_buf.clear();
+    rd_ecc_buf.reserve(PDU_RD_DEPTH);
+    wr_ecc_buf.reserve(PDU_WR_DEPTH);
     ECC_BUF_Entry buf_entry;
 
-    for (size_t i=0; i<PDU_DEPTH; i++) {
+    for (size_t i=0; i<PDU_RD_DEPTH; i++) {
         buf_entry.buf_id        = i;
         buf_entry.ecc_buf_addr  = i;
         buf_entry.vld           = false;
@@ -55,12 +57,18 @@ Inline_ECC::Inline_ECC(MemoryController *_top,unsigned id, ostream &DDRSim_log_)
         buf_entry.rd_ecc = false;
         buf_entry.wr_ecc = false;
 
-        buf_entry.ecc_pri=PDU_DEPTH;
+        buf_entry.ecc_pri=PDU_RD_DEPTH;
         buf_entry.wr_merge_cnt=0;
+        buf_entry.wr_hit_cnt=0;
 
         rd_ecc_buf.push_back(buf_entry);
+    }
+    for (size_t i=0; i<PDU_WR_DEPTH; i++) {
+        buf_entry.buf_id = i;
+        buf_entry.ecc_buf_addr = i;
+        buf_entry.ecc_pri = PDU_WR_DEPTH;
+        buf_entry.wr_hit_cnt = 0;
         wr_ecc_buf.push_back(buf_entry);
-
     }
 
     counter = 0;
@@ -69,14 +77,19 @@ Inline_ECC::Inline_ECC(MemoryController *_top,unsigned id, ostream &DDRSim_log_)
     try_count=0;
     rhit=0;
     whit=0;
+    pdu_read_query_count=0;
+    pdu_read_hit_count=0;
+    pdu_write_query_count=0;
+    pdu_write_hit_count=0;
     merge_cnt=0;
-    merge_id = PDU_DEPTH;
+    merge_id = 0xffff;
     wpos[17]={0};
     ecc_merge_flag=false;
     ecc_model_state = TRY_HIT_ECC_BUF;
     ecc_pre_state = TRY_HIT_ECC_BUF;
     pdu_push_pending_trans = NULL;
     pdu_push_pending_wr_ecc_buf_id = 0xffff;
+    current_wr_pdu_hit = false;
     iecc_owner_valid = false;
     iecc_owner_task = 0;
     iecc_owner_address = 0;
@@ -133,7 +146,7 @@ uint32_t Inline_ECC::hit_ecc_buf(uint64_t pdu_address) {
     this->avail_wr_ecc_buf_id = 0xffff;
 
     try_count++;
-    for (size_t index=0; index<PDU_DEPTH; index++) {
+    for (size_t index=0; index<PDU_RD_DEPTH; index++) {
         if (this->rd_ecc_buf.at(index).vld) {
             //======================check if hit ecc_buf=========================//
             if (pdu_address == this->rd_ecc_buf.at(index).pdu_addr) {
@@ -145,7 +158,7 @@ uint32_t Inline_ECC::hit_ecc_buf(uint64_t pdu_address) {
         }
     }
 
-    for (size_t index=0; index<PDU_DEPTH; index++) {
+    for (size_t index=0; index<PDU_WR_DEPTH; index++) {
         if (this->wr_ecc_buf.at(index).vld) {
             //======================check if hit ecc_buf=========================//
             if (pdu_address == this->wr_ecc_buf.at(index).pdu_addr) {
@@ -304,7 +317,7 @@ uint32_t Inline_ECC::get_avail_wr_ecc_buf_id() {
 }
 //==============================================================================
 void Inline_ECC::update_rd_ecc_buf() {
-    for (uint32_t index=0; index<PDU_DEPTH; index++) {
+    for (uint32_t index=0; index<PDU_RD_DEPTH; index++) {
         for (uint32_t i=0; i<rd_ecc_buf.at(index).task_list.size(); i++) {
             auto it = top->tasks_info.find(rd_ecc_buf.at(index).task_list.at(i));
             if (it != top->tasks_info.end()) {
@@ -323,7 +336,7 @@ void Inline_ECC::update_rd_ecc_buf() {
 }
 //==============================================================================
 void Inline_ECC::update_wr_ecc_buf() {
-    for (uint32_t index=0; index<PDU_DEPTH; index++) {
+    for (uint32_t index=0; index<PDU_WR_DEPTH; index++) {
         for (uint32_t i=0; i<wr_ecc_buf.at(index).task_list.size(); i++) {
             auto it = top->tasks_info.find(wr_ecc_buf.at(index).task_list.at(i));
             if (it != top->tasks_info.end()) {
@@ -410,7 +423,7 @@ void Inline_ECC::get_pdu_addr(ECC_BUF_Entry *buf, Transaction *trans) {
     trans->bank = (buf->pdu_addr >> PDU_BA) & ((1ull << (PDU_RA - PDU_BA)) - 1ull);
     trans->rank = buf->pdu_addr >> PDU_RA;
 //    trans->col = 0;
-    trans->col = (buf->pdu_addr & ((1ull << (PDU_ROW)) - 1ull)) << (8ull + unsigned(IECC_BL32_MODE));
+    trans->col = (buf->pdu_addr & ((1ull << (PDU_ROW)) - 1ull)) << (7ull + unsigned(IECC_BL32_MODE));
     trans->bankIndex = trans->rank * NUM_BANKS + trans->group * (NUM_BANKS / NUM_GROUPS) + trans->bank;
     trans->address = buf->pdu_addr;
 }
@@ -431,10 +444,17 @@ bool Inline_ECC::try_add_ecc_rd(Transaction * trans, uint32_t rd_ecc_buf_id) {
     trans_rd_ecc->task = ecc_task;
     trans_rd_ecc->inject_time = now();
     top->parentMemorySystem->trans_init(trans_rd_ecc, now());
+    if (IECC_PRI_FOLLOW) {
+        trans_rd_ecc->qos = trans->qos;
+        trans_rd_ecc->pri = trans->pri;
+    } else {
+        trans_rd_ecc->qos = IECC_PRI;
+        trans_rd_ecc->pri = IECC_PRI;
+    }
 //    trans_rd_ecc->qos = IECC_PRI;
 //    trans_rd_ecc->pri = IECC_PRI;
-    trans_rd_ecc->qos = trans->qos;
-    trans_rd_ecc->pri = trans->pri;
+//    trans_rd_ecc->qos = trans->qos;
+//    trans_rd_ecc->pri = trans->pri;
 //    addressMapping(*trans_rd_ecc);
 //    addr_exp(trans_rd_ecc);
 //    if (RMW_ENABLE) {
@@ -482,9 +502,17 @@ bool Inline_ECC::try_add_ecc_wr(Transaction * trans, uint32_t wr_ecc_buf_id) {
     trans_wr_ecc->task = ecc_task;
     trans_wr_ecc->inject_time = now();
     top->parentMemorySystem->trans_init(trans_wr_ecc, now());
+    if (IECC_PRI_FOLLOW) {
+        trans_wr_ecc->qos = trans->qos;
+        trans_wr_ecc->pri = trans->pri;
+    } else {
     trans_wr_ecc->qos = IECC_PRI;
     trans_wr_ecc->pri = IECC_PRI;
-    if (PDU_PUSH_MODE && trans->transactionType == DATA_WRITE && !trans->mask_wcmd) {
+    }
+    // trans_wr_ecc->qos = IECC_PRI;
+    // trans_wr_ecc->pri = IECC_PRI;
+    if ((PDU_PUSH_MODE || trans == pdu_push_pending_trans)
+            && trans->transactionType == DATA_WRITE && !trans->mask_wcmd) {
         addr_ecc_map(trans_wr_ecc);
     } else {
         get_pdu_addr(&wr_ecc_buf[wr_ecc_buf_id], trans_wr_ecc);
@@ -535,14 +563,34 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
             uint32_t hit_result;
             // pdu_addr: [2:0]->col, [20:3]->row, [22:21]->bg, [25:23]->ba, [26]->rank
             // Redundant bits are added to increase the signal bit width.
-            pdu_addr = trans->col >> (8ull + unsigned(IECC_BL32_MODE));
+            pdu_addr = trans->col >> (7ull + unsigned(IECC_BL32_MODE));
             pdu_addr |= uint64_t(trans->row) << PDU_ROW;
             pdu_addr |= uint64_t(trans->group) << PDU_BG;
             pdu_addr |= uint64_t(trans->bank) << PDU_BA;
             pdu_addr |= uint64_t(trans->rank) << PDU_RA;
             hit_result = hit_ecc_buf(pdu_addr);
+            if (trans->transactionType == DATA_READ) {
+                pdu_read_query_count++;
+                if ((hit_result & 1) != 0) {
+                    pdu_read_hit_count++;
+                }
+            } else if (trans->transactionType == DATA_WRITE) {
+                pdu_write_query_count++;
+                current_wr_pdu_hit = (hit_result & 2) != 0;
+                if ((hit_result & 2) != 0) {
+                    pdu_write_hit_count++;
+                }
+            }
             if (DEBUG_BUS) {
-                    PRINTN(setw(10)<<now()<<" -- TRY_HIT_ECC_BUF :: pdu_address=0x"<<hex<<pdu_addr<<endl);
+                uint64_t rd_owner_task = avail_rd_ecc_buf_id < PDU_RD_DEPTH && !rd_ecc_buf.at(avail_rd_ecc_buf_id).task_list.empty()
+                    ? rd_ecc_buf.at(avail_rd_ecc_buf_id).task_list.front() : UINT64_MAX;
+                uint64_t wr_owner_task = avail_wr_ecc_buf_id < PDU_WR_DEPTH && !wr_ecc_buf.at(avail_wr_ecc_buf_id).task_list.empty()
+                    ? wr_ecc_buf.at(avail_wr_ecc_buf_id).task_list.front() : UINT64_MAX;
+                PRINTN(setw(10)<<now()<<" -- PDU_QUERY :: address=0x"<<hex<<trans->address
+                    <<", task="<<dec<<trans->task<<", pdu_address=0x"<<hex<<pdu_addr
+                    <<", hit_result="<<dec<<hit_result<<", rd_buf_id="<<avail_rd_ecc_buf_id
+                    <<", wr_buf_id="<<avail_wr_ecc_buf_id<<", rd_owner_task="<<rd_owner_task
+                    <<", wr_owner_task="<<wr_owner_task<<endl);
             }
             if ((hit_result == 0) && (trans->transactionType == DATA_READ)) {
                 ecc_model_state = GET_ECC_BUF;
@@ -590,7 +638,7 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
             update_wr_ecc_buf();
             if (trans->transactionType == DATA_READ) {
                 avail_rd_ecc_buf_id = get_avail_rd_ecc_buf_id();
-                if (avail_rd_ecc_buf_id >= PDU_DEPTH) {
+                if (avail_rd_ecc_buf_id >= PDU_RD_DEPTH) {
                     ecc_model_state = GET_ECC_BUF;
                     if (DEBUG_BUS) {
                         PRINTN(setw(10)<<now()<<" -- GET_ECC_BUF_RD :: address=0x"<<hex<<trans->address
@@ -600,13 +648,22 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
                 }
             } else if (trans->transactionType == DATA_WRITE) {
                 avail_wr_ecc_buf_id = get_avail_wr_ecc_buf_id();
-                if (avail_wr_ecc_buf_id >= PDU_DEPTH) {
+                if (avail_wr_ecc_buf_id >= PDU_WR_DEPTH) {
                     ecc_model_state = GET_ECC_BUF;
                     if (DEBUG_BUS) {
                         PRINTN(setw(10)<<now()<<" -- GET_ECC_BUF_WR :: address=0x"<<hex<<trans->address
                                 <<", task="<<dec<<trans->task<<", nxt_state=GET_ECC_BUF"<<", avail_wr_ecc_buf_id="<<avail_wr_ecc_buf_id<<endl);
                     }
                     return false;
+                }
+                if (DEBUG_BUS) {
+                    uint64_t victim_task = wr_ecc_buf.at(avail_wr_ecc_buf_id).task_list.empty()
+                        ? UINT64_MAX : wr_ecc_buf.at(avail_wr_ecc_buf_id).task_list.front();
+                    PRINTN(setw(10)<<now()<<" -- PDU_ALLOC :: address=0x"<<hex<<trans->address
+                        <<", task="<<dec<<trans->task<<", pdu_address=0x"<<hex<<pdu_addr
+                        <<", buf_type=WR, buf_id="<<dec<<avail_wr_ecc_buf_id
+                        <<", victim_task="<<victim_task<<", victim_dirty="<<wr_ecc_buf.at(avail_wr_ecc_buf_id).ecc_dirty
+                        <<", victim_pdu_address=0x"<<hex<<wr_ecc_buf.at(avail_wr_ecc_buf_id).pdu_addr<<endl);
                 }
             } else {
                 assert(0 && "Transaction Type Error!");
@@ -627,6 +684,7 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
                     wr_ecc_buf.at(avail_wr_ecc_buf_id).wr_ecc_pos = 0;
                 }
                 wr_ecc_buf.at(avail_wr_ecc_buf_id).wr_merge_cnt = 0;//update 24/9/6
+                wr_ecc_buf.at(avail_wr_ecc_buf_id).wr_hit_cnt = 0;
                 replace_pri_update(this->avail_wr_ecc_buf_id,1);//update 24/9/5
                 if(ECC_MERGE_ENABLE && ecc_merge_flag){
                     if((wr_ecc_buf.at(merge_id).pdu_addr & 0x3) == 0x3){
@@ -638,7 +696,7 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
                     wr_ecc_buf.at(merge_id).wr_merge_cnt = 0;//update 24/9/6
                     wr_ecc_buf.at(merge_id).ecc_dirty = false;//update 24/9/6
                     replace_pri_update(merge_id,2);//update 24/9/6
-                    merge_id=PDU_DEPTH;
+                    merge_id=0xffff;
                 }
                 if (wr_ecc_buf.at(avail_wr_ecc_buf_id).ecc_dirty){
                     wr_ecc_buf.at(avail_wr_ecc_buf_id).wr_ecc = true;
@@ -712,9 +770,14 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
                     return (ecc_model_state == TRY_HIT_ECC_BUF);
                 }
             } else if (trans_cmd->transactionType == DATA_WRITE) {
-                bool pdu_push_wr = PDU_PUSH_MODE && !trans->mask_wcmd;
+                bool hit_level_push = current_wr_pdu_hit && PDU_HIT_LEVEL != 0
+                    && wr_ecc_buf.at(avail_wr_ecc_buf_id).wr_hit_cnt + 1 >= PDU_HIT_LEVEL;
+                bool pdu_push_wr = !trans->mask_wcmd && (PDU_PUSH_MODE || hit_level_push);
                 if (pdu_push_wr && !top->WillAcceptTransactions(1)) return false;
                 if (ecc_try_add_wr_trans(trans_cmd, avail_wr_ecc_buf_id)) {
+                    if (current_wr_pdu_hit) {
+                        wr_ecc_buf.at(avail_wr_ecc_buf_id).wr_hit_cnt++;
+                    }
                     if (pdu_push_wr) {
                         if (pdu_push_pending_trans != NULL) delete pdu_push_pending_trans;
                         pdu_push_pending_trans = new Transaction(trans);
@@ -725,6 +788,7 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
                         ecc_model_state = TRY_HIT_ECC_BUF;
                     }
                     wr_ecc_buf.at(avail_wr_ecc_buf_id).pdu_addr = pdu_addr;
+                    current_wr_pdu_hit = false;
                     if (DEBUG_BUS) {
                         PRINTN(setw(10)<<now()<<" -- ECC_ADD_TRANS :: address=0x"<<hex<<trans->address
                                 <<", task="<<dec<<trans->task<<", nxt_state=TRY_HIT_ECC_BUF"<<endl);
@@ -859,7 +923,7 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
             bool ret2 = false;
             update_rd_ecc_buf();
             avail_rd_ecc_buf_id = get_avail_rd_ecc_buf_id();
-            if (avail_rd_ecc_buf_id >= PDU_DEPTH) {
+            if (avail_rd_ecc_buf_id >= PDU_RD_DEPTH) {
                 ecc_model_state = GET_ECC_BUF;
                 return false;
             }
@@ -920,6 +984,7 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
 bool Inline_ECC::addTransaction(Transaction * trans) {
     if (pdu_push_pending_trans != NULL) {
         if (try_add_ecc_wr(pdu_push_pending_trans, pdu_push_pending_wr_ecc_buf_id)) {
+            wr_ecc_buf.at(pdu_push_pending_wr_ecc_buf_id).wr_hit_cnt = 0;
             delete pdu_push_pending_trans;
             pdu_push_pending_trans = NULL;
             pdu_push_pending_wr_ecc_buf_id = 0xffff;
@@ -1156,7 +1221,7 @@ void Inline_ECC::replace_pri_update(uint32_t id, uint32_t cmd_type){
                 tar_pri=wr_ecc_buf[id].ecc_pri;
                 for(auto &bufs : wr_ecc_buf){
                     if(bufs.buf_id==id){
-                        bufs.ecc_pri=PDU_DEPTH;
+                        bufs.ecc_pri=PDU_WR_DEPTH;
                     }
                     else{
                         if(bufs.ecc_pri>tar_pri){
@@ -1194,7 +1259,7 @@ void Inline_ECC::show_buf_state(){
     PRINTN("ECC_BUF_SIZE: "<< index_recycle_wr_ecc_buf.size() <<endl);
     PRINTN("ECC_MERGE_ENABLE: "<< ECC_MERGE_ENABLE <<endl);
     PRINTN("--------------------------------------------------------------------------------------------------"<<endl);
-    for (uint32_t index=0; index<PDU_DEPTH; index++) {
+    for (uint32_t index=0; index<PDU_WR_DEPTH; index++) {
         for (uint32_t i=0; i<wr_ecc_buf.at(index).task_list.size(); i++) {
             auto it = top->tasks_info.find(wr_ecc_buf.at(index).task_list.at(i));
             if (DEBUG_PDU) {
