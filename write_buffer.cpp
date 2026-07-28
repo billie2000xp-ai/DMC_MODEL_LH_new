@@ -222,10 +222,9 @@ bool WriteBuff::read_forward(Transaction * trans) {
         if (trans->col >= wbuf->col && (trans->col + 64/bytes_per_col) <= (wbuf->col + 64/bytes_per_col)) {
             for (size_t i = 0; i <= trans->burst_length; i ++) {
                 unsigned cnt = i % 2 + 1;
-                top->gen_rdata(trans->task, cnt, 0, trans->mask_wcmd);
+                top->gen_rdata(trans->task, cnt, 0, trans->mask_wcmd, false);
             }
             if (trans->data_size == 64) forward_cnt ++;
-            top->gen_wresp(trans->task);
 
             if (FASTWAKEUP_EN && !PREDICT_FASTWAKEUP) {
                 if (top->fast_wakeup_cnt[trans->rank] == 0 && now() >= 100) {
