@@ -346,8 +346,9 @@ void Rank::update() {
             if (readReturnPacket[i].delay == 0) {
                 outgoingDataPacket = readReturnPacket[i].task;
                 mask_wcmd_flag     = readReturnPacket[i].mask_wcmd;
+                memoryController->traceDfiRdata(outgoingDataPacket);
                 readReturnPacket.erase(readReturnPacket.begin() + i);
-                memoryController->receiveFromBus(outgoingDataPacket, mask_wcmd_flag);
+                memoryController->receiveFromBus(outgoingDataPacket, mask_wcmd_flag, false);
                 break;
             }
         }
