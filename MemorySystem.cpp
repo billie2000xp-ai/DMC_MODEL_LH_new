@@ -87,6 +87,10 @@ MemorySystem::MemorySystem(unsigned dmcId,unsigned hhaId, ostream &DDRSim_log_,s
     pre_merge_read_cnt = 0;
     pre_ecc_read_cnt = 0;
     pre_ecc_write_cnt = 0;
+    pre_pdu_read_query_count = 0;
+    pre_pdu_read_hit_count = 0;
+    pre_pdu_write_query_count = 0;
+    pre_pdu_write_hit_count = 0;
     pre_reads = 0;
     pre_writes = 0;
     pre_totals = 0;
@@ -369,11 +373,6 @@ bool MemorySystem::submitTransaction(Transaction *trans) {
     if (ret) {
         access_cnt ++;
         total_access_cnt ++;
-        if (DEBUG_BUS && trans->transactionType != DATA_READ) {
-            PRINTN(setw(10)<<now()<<" -- SUBMIT_TXN_OK :: task="<<trans->task<<" type="<<trans->transactionType
-                    <<" mask="<<trans->mask_wcmd<<" ecc="<<trans->ecc_flag<<" burst="<<trans->burst_length
-                    <<" addr=0x"<<hex<<trans->address<<dec<<" write_map_size="<<write_map.size()<<endl);
-        }
         bool needs_write_data = trans->transactionType != DATA_READ
                 && trans->data_ready_cnt <= trans->burst_length;
         if (needs_write_data) {
@@ -765,6 +764,7 @@ float MemorySystem::flowStatistic() {
 }
 //==============================================================================
 void MemorySystem::statistics() {
+    memoryController->rmw->statistics();
     unsigned size = 0;
     STATE_PRINTN(setiosflags(ios::left));
     STATE_PRINTN("======================================== START ========================================\n");
@@ -1745,6 +1745,12 @@ void MemorySystem::statistics() {
         STATE_PRINTN(setw(7)<<fixed<<setprecision(3)<<que_cnt.at(index)<<"|");
     }
     STATE_PRINTN(endl);
+    uint64_t weighted_que_depth = 0;
+    for (uint32_t index = 0; index < size; index++) {
+        weighted_que_depth += static_cast<uint64_t>(index) * que_cnt.at(index);
+    }
+    double average_que_depth = total == 0 ? 0.0 : static_cast<double>(weighted_que_depth) / total;
+    STATE_PRINTN("Average queue depth : "<<fixed<<setprecision(3)<<average_que_depth<<endl);
     for (uint32_t index = 0; index <= size; index ++) {
         STATE_PRINTN("--------");
     }
@@ -1786,6 +1792,30 @@ void MemorySystem::statistics() {
 
     for (uint32_t index = 0; index < size; index++) {
         memoryController->rmw->rmw_que_cnt.at(index) = 0;
+    }
+
+    if (IECC_ENABLE) {
+        uint64_t pdu_read_queries = memoryController->iecc->pdu_read_query_count;
+        uint64_t pdu_read_hits = memoryController->iecc->pdu_read_hit_count;
+        uint64_t pdu_write_queries = memoryController->iecc->pdu_write_query_count;
+        uint64_t pdu_write_hits = memoryController->iecc->pdu_write_hit_count;
+        uint64_t current_read_queries = pdu_read_queries - pre_pdu_read_query_count;
+        uint64_t current_read_hits = pdu_read_hits - pre_pdu_read_hit_count;
+        uint64_t current_write_queries = pdu_write_queries - pre_pdu_write_query_count;
+        uint64_t current_write_hits = pdu_write_hits - pre_pdu_write_hit_count;
+        double current_read_hit_rate = current_read_queries == 0 ? 0.0 : 100.0 * current_read_hits / current_read_queries;
+        double total_read_hit_rate = pdu_read_queries == 0 ? 0.0 : 100.0 * pdu_read_hits / pdu_read_queries;
+        double current_write_hit_rate = current_write_queries == 0 ? 0.0 : 100.0 * current_write_hits / current_write_queries;
+        double total_write_hit_rate = pdu_write_queries == 0 ? 0.0 : 100.0 * pdu_write_hits / pdu_write_queries;
+        STATE_PRINTN("------------------------- PDU Hit Statistics -----------------------------------\n");
+        STATE_PRINTN("Read query      : "<<setw(8)<<current_read_queries<<" | Total read query  : "<<setw(8)<<pdu_read_queries<<" |"<<endl);
+        STATE_PRINTN("Read hit        : "<<setw(8)<<current_read_hits<<" | Total read hit    : "<<setw(8)<<pdu_read_hits<<" |"<<endl);
+        STATE_PRINTN("Read miss       : "<<setw(8)<<(current_read_queries-current_read_hits)<<" | Total read miss   : "<<setw(8)<<(pdu_read_queries-pdu_read_hits)<<" |"<<endl);
+        STATE_PRINTN("Read hit rate(%) : "<<setw(8)<<fixed<<setprecision(3)<<current_read_hit_rate<<" | Total read rate   : "<<setw(8)<<total_read_hit_rate<<" |"<<endl);
+        STATE_PRINTN("Write query     : "<<setw(8)<<current_write_queries<<" | Total write query : "<<setw(8)<<pdu_write_queries<<" |"<<endl);
+        STATE_PRINTN("Write hit       : "<<setw(8)<<current_write_hits<<" | Total write hit   : "<<setw(8)<<pdu_write_hits<<" |"<<endl);
+        STATE_PRINTN("Write miss      : "<<setw(8)<<(current_write_queries-current_write_hits)<<" | Total write miss  : "<<setw(8)<<(pdu_write_queries-pdu_write_hits)<<" |"<<endl);
+        STATE_PRINTN("Write hit rate(%): "<<setw(8)<<fixed<<setprecision(3)<<current_write_hit_rate<<" | Total write rate  : "<<setw(8)<<total_write_hit_rate<<" |"<<endl);
     }
 
     if(DEBUG_PDU){
@@ -1844,6 +1874,10 @@ void MemorySystem::statistics() {
     pre_row_miss_cnt = row_miss_cnt;
     pre_ecc_read_cnt = ecc_read_cnt;
     pre_ecc_write_cnt = ecc_write_cnt;
+    pre_pdu_read_query_count = memoryController->iecc->pdu_read_query_count;
+    pre_pdu_read_hit_count = memoryController->iecc->pdu_read_hit_count;
+    pre_pdu_write_query_count = memoryController->iecc->pdu_write_query_count;
+    pre_pdu_write_hit_count = memoryController->iecc->pdu_write_hit_count;
     pre_merge_read_cnt = merge_read_cnt;
     pre_rw_switch_cnt = rw_switch_cnt;
     pre_rank_switch_cnt = rank_switch_cnt;
