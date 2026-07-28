@@ -814,7 +814,7 @@ void Rmw::arb_node() {
         bool merged_command = write_merge_first_resp_task.find(RmwQue[i]->task)
                 != write_merge_first_resp_task.end();
         if (is_write_merge_candidate(RmwQue[i]) && !merged_command
-                && RmwCmdState[i]->rmwState != SEND_READY) {
+                && !is_unpaired_write_merge_timeout(RmwQue[i], RmwCmdState[i])) {
             continue;
         }
         if ((RmwQue[i]->transactionType == DATA_WRITE)&&(RmwQue[i]->mask_wcmd==false)&&(RMW_CMD_MODE==1)&&(RmwCmdState[i]-> rmwState!=SEND_READY)) {
