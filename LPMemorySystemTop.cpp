@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <math.h>
 #include "LPMemorySystemTop.h"
+#include "../Monitor/Monitor.h"
 #include "AddressMapping.h"
 #include "TimingCalculate.h"
 #include "IniReader.h"
@@ -37,6 +38,15 @@ LPMemorySystemTop::LPMemorySystemTop(unsigned hhaId, string IniFilePath, string 
     rw_sync_reverse_cmd_cnt = 0;
     rw_sync_rw_cmd_num = 0;
     rw_sync_act_cmd_num = 0;
+    trace_prefix = "LPTOP" + std::to_string(hhaId) + "_";
+    trace_cmd_in_valid = false;
+    trace_cmd_in_accept = false;
+    trace_cmd_in_to_rmw = false;
+    trace_wdata_in_valid = false;
+    trace_wdata_in_accept = false;
+    trace_rdata_out_valid = false;
+    trace_rdata_out_accept = false;
+    traceRegister();
 
 #ifdef SYSARCH_PLATFORM
     IniFilename = "parameter/public.ini";
@@ -1202,7 +1212,11 @@ void LPMemorySystemTop::update() {
         }
         if (top_rdata_ready_to_send && idx < top_rdata_fifo.size()) {
             TopRespPacket pkt = top_rdata_fifo[idx];
+            trace_rdata_out_valid = true;
+            trace_rdata_out_task = pkt.task;
+            trace_rdata_out_channel = pkt.channel;
             if (read_cb == NULL || (*read_cb)(pkt.channel, pkt.task, pkt.readDataEnterDmcTime, pkt.reqAddToDmcTime, pkt.reqEnterDmcBufTime)) {
+                trace_rdata_out_accept = true;
                 top_rdata_fifo.erase(top_rdata_fifo.begin() + idx);
                 auto it2 = expected_read_beats_map.find(pkt.task);
                 if (it2 != expected_read_beats_map.end()) {
@@ -1244,6 +1258,8 @@ void LPMemorySystemTop::update() {
         }
     }
 
+    traceSample();
+
 //    if (RMW_ENABLE) {
 //        rmw->step();
 //    }
@@ -1257,6 +1273,63 @@ void LPMemorySystemTop::update() {
 //        }
 //    }
 //    rmw->check_cnt();
+}
+
+void LPMemorySystemTop::traceRegister() {
+    TRACE_ADD(trace_prefix + "CMD_IN_VALID", 1);
+    TRACE_ADD(trace_prefix + "CMD_IN_ACCEPT", 1);
+    TRACE_ADD(trace_prefix + "CMD_IN_TYPE", 1);
+    TRACE_ADD(trace_prefix + "CMD_IN_TASK", 64);
+    TRACE_ADD(trace_prefix + "CMD_IN_ADDRESS", 64);
+    TRACE_ADD(trace_prefix + "CMD_IN_DATA_SIZE", 32);
+    TRACE_ADD(trace_prefix + "CMD_IN_BURST_LENGTH", 16);
+    TRACE_ADD(trace_prefix + "CMD_IN_TARGET_DMC", 8);
+    TRACE_ADD(trace_prefix + "CMD_IN_BANK", 16);
+    TRACE_ADD(trace_prefix + "CMD_IN_ROW", 32);
+    TRACE_ADD(trace_prefix + "CMD_IN_COL", 32);
+    TRACE_ADD(trace_prefix + "CMD_IN_TO_RMW", 1);
+    TRACE_ADD(trace_prefix + "WDATA_IN_VALID", 1);
+    TRACE_ADD(trace_prefix + "WDATA_IN_ACCEPT", 1);
+    TRACE_ADD(trace_prefix + "WDATA_IN_TASK", 64);
+    TRACE_ADD(trace_prefix + "WDATA_IN_CHANNEL", 8);
+    TRACE_ADD(trace_prefix + "RDATA_OUT_VALID", 1);
+    TRACE_ADD(trace_prefix + "RDATA_OUT_ACCEPT", 1);
+    TRACE_ADD(trace_prefix + "RDATA_OUT_TASK", 64);
+    TRACE_ADD(trace_prefix + "RDATA_OUT_CHANNEL", 8);
+    TRACE_ADD(trace_prefix + "RW_SYNC_VALID", 1);
+    TRACE_ADD(trace_prefix + "RW_SYNC_GROUP", 2);
+}
+
+void LPMemorySystemTop::traceSample() {
+    TRACE_LOG(trace_prefix + "CMD_IN_VALID", trace_cmd_in_valid);
+    TRACE_LOG(trace_prefix + "CMD_IN_ACCEPT", trace_cmd_in_accept);
+    TRACE_LOG(trace_prefix + "CMD_IN_TYPE", trace_cmd_in_type);
+    TRACE_LOG(trace_prefix + "CMD_IN_TASK", trace_cmd_in_task);
+    TRACE_LOG(trace_prefix + "CMD_IN_ADDRESS", trace_cmd_in_address);
+    TRACE_LOG(trace_prefix + "CMD_IN_DATA_SIZE", trace_cmd_in_data_size);
+    TRACE_LOG(trace_prefix + "CMD_IN_BURST_LENGTH", trace_cmd_in_burst_length);
+    TRACE_LOG(trace_prefix + "CMD_IN_TARGET_DMC", trace_cmd_in_target_dmc);
+    TRACE_LOG(trace_prefix + "CMD_IN_BANK", trace_cmd_in_bank_index);
+    TRACE_LOG(trace_prefix + "CMD_IN_ROW", trace_cmd_in_row);
+    TRACE_LOG(trace_prefix + "CMD_IN_COL", trace_cmd_in_col);
+    TRACE_LOG(trace_prefix + "CMD_IN_TO_RMW", trace_cmd_in_to_rmw);
+    TRACE_LOG(trace_prefix + "WDATA_IN_VALID", trace_wdata_in_valid);
+    TRACE_LOG(trace_prefix + "WDATA_IN_ACCEPT", trace_wdata_in_accept);
+    TRACE_LOG(trace_prefix + "WDATA_IN_TASK", trace_wdata_in_task);
+    TRACE_LOG(trace_prefix + "WDATA_IN_CHANNEL", trace_wdata_in_channel);
+    TRACE_LOG(trace_prefix + "RDATA_OUT_VALID", trace_rdata_out_valid);
+    TRACE_LOG(trace_prefix + "RDATA_OUT_ACCEPT", trace_rdata_out_accept);
+    TRACE_LOG(trace_prefix + "RDATA_OUT_TASK", trace_rdata_out_task);
+    TRACE_LOG(trace_prefix + "RDATA_OUT_CHANNEL", trace_rdata_out_channel);
+    TRACE_LOG(trace_prefix + "RW_SYNC_VALID", rw_sync_group_valid);
+    TRACE_LOG(trace_prefix + "RW_SYNC_GROUP", rw_sync_group);
+    trace_cmd_in_valid = false;
+    trace_cmd_in_accept = false;
+    trace_cmd_in_to_rmw = false;
+    trace_wdata_in_valid = false;
+    trace_wdata_in_accept = false;
+    trace_rdata_out_valid = false;
+    trace_rdata_out_accept = false;
 }
 
 uint8_t LPMemorySystemTop::get_occ(uint8_t chl) {
@@ -1281,6 +1354,18 @@ void LPMemorySystemTop::noc_read_inform(uint8_t channel, bool fast_wakeup_rank0,
 bool LPMemorySystemTop::addTransaction(const hha_command &command) {
     command_check(command);
     uint8_t ch = addr_map_ch(command);
+    trace_cmd_in_valid = true;
+    trace_cmd_in_accept = false;
+    trace_cmd_in_type = command.type;
+    trace_cmd_in_task = command.task;
+    trace_cmd_in_address = command.address;
+    trace_cmd_in_data_size = (command.burst_length + 1) * DMC_DATA_BUS_BITS / 8;
+    trace_cmd_in_burst_length = command.burst_length;
+    trace_cmd_in_target_dmc = (EM_ENABLE && EM_MODE == 0) ? 0 : ch;
+    trace_cmd_in_bank_index = 0;
+    trace_cmd_in_row = 0;
+    trace_cmd_in_col = 0;
+    trace_cmd_in_to_rmw = false;
 
     //GRANT FIFO BP under LP6 Nomal mode
     if (!EM_ENABLE && IS_LP6 && channels[1]->memoryController->grt_fifo_bp) {
@@ -1301,6 +1386,9 @@ bool LPMemorySystemTop::addTransaction(const hha_command &command) {
 
     addressMapping(*trans);
     trans_check(trans);
+    trace_cmd_in_bank_index = trans->bankIndex;
+    trace_cmd_in_row = trans->row;
+    trace_cmd_in_col = trans->addr_col;
     
 //    if (RMW_ENABLE && !trans->pre_act) {
 //        ret = rmw->addTransaction(trans);
@@ -1318,6 +1406,7 @@ bool LPMemorySystemTop::addTransaction(const hha_command &command) {
         delete trans;
     }
     
+    trace_cmd_in_accept = ret;
     return ret;
 }
 
@@ -1361,6 +1450,9 @@ uint32_t LPMemorySystemTop::getDmcPressureLevel() {
 }
 
 bool LPMemorySystemTop::addData(uint32_t *data,uint32_t channel,uint64_t id) {
+    trace_wdata_in_valid = true;
+    trace_wdata_in_task = id;
+    trace_wdata_in_channel = channel;
 //    if (RMW_ENABLE && rmw->pre_req_data_time == rmw->now()) {
 //        return false;
 //    }
@@ -1374,6 +1466,7 @@ bool LPMemorySystemTop::addData(uint32_t *data,uint32_t channel,uint64_t id) {
 //        ret = channels[channel]->addData(data, id);
 //    }
     ret = channels[channel]->addData(data, id, false);
+    trace_wdata_in_accept = ret;
     return ret;
 }
 
