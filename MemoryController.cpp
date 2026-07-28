@@ -8748,7 +8748,7 @@ void MemoryController::lc(Transaction *t) {
     }
 #else
     // samerank precharge blocked before pbr precharge sent
-    if (!IS_DDR5 && t->nextCmd == PRECHARGE_PB_CMD) {   //todo: revise for e-mode
+    if (!IS_DDR5 && t->nextCmd == PRECHARGE_PB_CMD && t->issue_size == 0) {   //todo: revise for e-mode
         for (size_t bank = 0; bank < NUM_BANKS; bank ++) {
             unsigned bank_tmp = t->rank * NUM_BANKS + bank;
 //            refreshPerBank[bank_tmp].refreshWaitingPre =false;
@@ -9296,6 +9296,7 @@ bool MemoryController::refresh_backlog_blocks_external(const Transaction *trans)
 
 //allows outside source to make request of memory system
 bool MemoryController::addTransaction(Transaction *trans) {
+    if (pre_req_time == now()) return false;
     if (!full()) {
         auto &state = bankStates[trans->bankIndex];
         trans_state_init(trans);
