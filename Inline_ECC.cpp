@@ -89,6 +89,7 @@ Inline_ECC::Inline_ECC(MemoryController *_top,unsigned id, ostream &DDRSim_log_)
     ecc_pre_state = TRY_HIT_ECC_BUF;
     pdu_push_pending_trans = NULL;
     pdu_push_pending_wr_ecc_buf_id = 0xffff;
+    pdu_push_pending_cycle = 0;
     current_wr_pdu_hit = false;
     iecc_owner_valid = false;
     iecc_owner_task = 0;
@@ -782,6 +783,7 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
                         if (pdu_push_pending_trans != NULL) delete pdu_push_pending_trans;
                         pdu_push_pending_trans = new Transaction(trans);
                         pdu_push_pending_wr_ecc_buf_id = avail_wr_ecc_buf_id;
+                        pdu_push_pending_cycle = now();
                         ecc_model_state = TRY_HIT_ECC_BUF;
                         ecc_pre_state = ADD_WR_ECC_TRANS;
                     } else {
@@ -1046,6 +1048,16 @@ bool Inline_ECC::addData(uint32_t *data ,uint64_t task) {
 
 void Inline_ECC::update() {
     show_buf_state();
+    if (pdu_push_pending_trans != NULL && now() > pdu_push_pending_cycle) {
+        if (try_add_ecc_wr(pdu_push_pending_trans, pdu_push_pending_wr_ecc_buf_id)) {
+            wr_ecc_buf.at(pdu_push_pending_wr_ecc_buf_id).wr_hit_cnt = 0;
+            delete pdu_push_pending_trans;
+            pdu_push_pending_trans = NULL;
+            pdu_push_pending_wr_ecc_buf_id = 0xffff;
+            ecc_model_state = TRY_HIT_ECC_BUF;
+            ecc_pre_state = ADD_WR_ECC_TRANS;
+        }
+    }
     return; // Delete
 
     iecc_alct();
