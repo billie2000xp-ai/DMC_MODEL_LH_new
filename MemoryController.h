@@ -18,6 +18,8 @@
 #include <assert.h>
 #include <numeric>
 #include <algorithm>
+#include <unordered_set>
+#include <unordered_map>
 
 using namespace std;
 
@@ -60,7 +62,7 @@ public:
             double readDataEnterDmcTime, double reqAddToDmcTime, double reqEnterDmcBufTime);
     void ReturnData_statistics(uint64_t task, uint64_t timeAdded, unsigned qos, unsigned mid, unsigned pf_type, unsigned rank);
     void Cmd2Dfi_statistics(uint64_t task, uint64_t timeAdded, unsigned qos, unsigned mid, unsigned pf_type, unsigned rank);
-    void receiveFromBus(unsigned long long task, bool mask_wcmd);
+    void receiveFromBus(unsigned long long task, bool mask_wcmd, bool ps);
     void receiveFromCPU(unsigned *data ,uint64_t task);
     bool canReceiveWdata(uint64_t task) const;
     void attachRanks(vector<Rank *> *rank);
@@ -93,20 +95,29 @@ public:
     enum DIST_STATE {DIST_IDLE, SEND_ACT1, SEND_ACT2, SEND_PRE};
     struct GD2_DIST_STATE {
         DIST_STATE state;
+        DIST_STATE bank_state;
         unsigned bank;
         vector <uint32_t> pre_cmd_cnt;
         vector <uint32_t> dist_pstpnd_num;
         vector<uint32_t> pre_cmd_cnt_fg;
         bool force_dist_refresh;
+        uint32_t pre_cmd_cnt_bank;
+        uint32_t pre_cmd_cnt_fg_bank;
+        uint32_t dist_pstpnd_num_bank;
+        bool force_dist_refresh_bank;
         GD2_DIST_STATE (size_t index) {
             state = DIST_IDLE;
             bank = index;
-            for (size_t i = 0; i < 4; i ++) {
+            for (size_t i = 0; i < NUM_MATGRPS; i ++) {
                 pre_cmd_cnt.push_back(0);
                 dist_pstpnd_num.push_back(0);
                 pre_cmd_cnt_fg.push_back(0);
             }
             force_dist_refresh = false;
+            pre_cmd_cnt_bank = 0;
+            pre_cmd_cnt_fg_bank = 0;
+            dist_pstpnd_num_bank = 0;
+            force_dist_refresh_bank = false;
         }
     };
     vector <GD2_DIST_STATE> DistRefState;
@@ -157,6 +168,8 @@ public:
     void page_timeout_policy();
     void update_rwgroup_state();
     void update_rw_schedulable_counts();
+    unsigned GetDmcAvailability() const;
+    unsigned GetDmcWriteAvailability() const;
     void update_group_state();
     void page_adapt_policy(Transaction *trans);
     void page_adpt_policy(Transaction *trans);
@@ -238,6 +251,9 @@ public:
     bool push_req(Transaction * trans);
     bool push_after_rmw(Transaction *trans);
     bool push_after_iecc(Transaction *trans);
+    void traceRegister();
+    void traceSample();
+    void traceDfiRdata(uint64_t task);
 
     //fields
     vector<Transaction *> transactionQueue;
@@ -499,8 +515,33 @@ private:
     vector <uint64_t> ReadResp;
     vector <uint64_t> CmdResp;
 //    vector<data_packet>read_data_buffer;
+    deque<uint64_t> rdata_ready_tasks;
     deque<data_packet> rp_fifo;
     bool rcmd_bp_byrp;
+    string trace_prefix;
+    bool trace_cmd_in_valid;
+    bool trace_cmd_in_accept;
+    TransactionType trace_cmd_in_type;
+    uint64_t trace_cmd_in_task;
+    uint64_t trace_cmd_in_address;
+    uint32_t trace_cmd_in_data_size;
+    uint32_t trace_cmd_in_burst_length;
+    uint32_t trace_cmd_in_bank_index;
+    uint64_t trace_cmd_in_row;
+    bool trace_wdata_in_valid;
+    uint64_t trace_wdata_in_task;
+    bool trace_dfi_cmd_fire;
+    TransactionCmd trace_dfi_cmd_type;
+    uint64_t trace_dfi_cmd_task;
+    uint32_t trace_dfi_cmd_bank_index;
+    uint64_t trace_dfi_cmd_row;
+    uint64_t trace_dfi_cmd_addr_col;
+    uint32_t trace_dfi_cmd_bl;
+    bool trace_dfi_wdata_valid;
+    uint64_t trace_dfi_wdata_task;
+    uint32_t trace_dfi_wdata_bl;
+    bool trace_dfi_rdata_valid;
+    uint64_t trace_dfi_rdata_task;
     TransactionCmd activate_cmd;
     bool core_concurr_en;
     uint8_t cmd_cycle;
@@ -537,7 +578,7 @@ public:
     void gen_cresp(uint64_t task);
     void gen_wresp(uint64_t task);
     void gen_rresp(uint64_t task);
-    void gen_rdata(uint64_t task, unsigned cnt, unsigned delay, bool mask_wcmd);
+    void gen_rdata(uint64_t task, unsigned cnt, unsigned delay, bool mask_wcmd, bool ps);
     void push_pending_TransactionQue(Transaction *trans);
     void rank_group_weight(unsigned * rank, unsigned * type);
     unsigned max_bl_data_size;
@@ -616,6 +657,32 @@ public:
     vector <unsigned> grp_sid_level;
     vector <unsigned> max_rcmd_bank;
     vector <unsigned> max_wcmd_bank;
+
+    bool write_port_busy_this_cycle;
+    uint32_t ecc_wb_cnt;
+    std::unordered_map<uint64_t, TRANS_MSG> ecc_wb_pending_wr;
+    std::vector<Transaction *> ecc_wb_queue;
+    std::vector<Transaction *> ps_rd_queue;
+    std::vector<std::pair<Transaction *, uint64_t>> delayed_ecc_wb_queue;
+    std::unordered_set<uint64_t> ecc_checked_tasks;
+    std::unordered_set<uint64_t> tasks_need_ecc_wb;
+    std::unordered_map<uint64_t, uint64_t> task_ecc_release_time;
+    void update_ecc_wb_delay();
+    Transaction* ps_rd_trans;
+    uint64_t next_ps_cycle;
+    uint64_t current_ps_addr;
+    uint64_t ps_task_counter;
+    uint32_t ps_rank;
+    uint32_t ps_sid;
+    uint32_t ps_group;
+    uint32_t ps_bank;
+    uint32_t ps_row;
+    uint32_t ps_col;
+    void update_patrol_scrubbing();
+    bool wdata_half_beat_done;
+    uint8_t GetRwGroupTarget() const;
+    uint8_t GetRwGroupCurrent() const;
+    unsigned mrd_wr_availability;
 };
 }
 #endif
