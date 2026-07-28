@@ -161,6 +161,10 @@ public:
     unsigned pre_merge_read_cnt;
     unsigned pre_ecc_read_cnt;
     unsigned pre_ecc_write_cnt;
+    uint64_t pre_pdu_read_query_count;
+    uint64_t pre_pdu_read_hit_count;
+    uint64_t pre_pdu_write_query_count;
+    uint64_t pre_pdu_write_hit_count;
 
     unsigned Total_func_pre_cnt;
 
