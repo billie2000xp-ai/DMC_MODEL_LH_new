@@ -26,8 +26,8 @@ namespace LPDDRSim {
 class MemoryController;
 //class LPMemorySystemTop;
 class Rmw:public SimulatorObject {
-//    ofstream DDRSim_log;
-//    ofstream state_log;
+    ofstream rmw_log;
+    ofstream state_log;
 
     enum RMW_State {
         QUE_WAITING,
@@ -64,7 +64,7 @@ class Rmw:public SimulatorObject {
     bool canAcceptData(uint64_t task) const;
     bool hasPendingWork() const;
     bool flushWriteMergeBuffer();
-//    void RmwInitOutputFiles();
+    void RmwInitOutputFiles();
     void cmd_set_conflict(Transaction *trans);
     void cmd_release_conflict(Transaction *trans);
     bool address_conf(Transaction *t, Transaction *cmd);
@@ -93,10 +93,7 @@ class Rmw:public SimulatorObject {
     void track_write_command(uint64_t task, unsigned beats);
     void check_write_data(uint64_t task);
 
-//    string rmw_log;
-//    string log_path;
-//    unsigned channel;
-//    uint64_t channel_ohot;
+    string rmw_log_path;
     
 
     uint64_t pre_cresp_time;
@@ -108,7 +105,7 @@ class Rmw:public SimulatorObject {
     unsigned GetRmwQsize();
     void check_cnt();
 //    void register_write(uint64_t address, uint32_t data);
-//    void statistics();
+    void statistics();
 
     //statistics
     unsigned totalReads; 
@@ -118,6 +115,10 @@ class Rmw:public SimulatorObject {
     unsigned totalFullWrites; 
     unsigned totalMaskWrites; 
     unsigned totalTransactions;
+    unsigned merge_candidates;
+    unsigned merge_pairs;
+    unsigned merge_unpaired_flushes;
+    unsigned merge_remap_beats;
 //    unsigned pre_reads; 
 //    unsigned pre_bypass_reads; 
 //    unsigned pre_bypass_writes; 
