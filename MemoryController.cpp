@@ -8,7 +8,7 @@ static bool is_dmc_merge_pri_candidate(Transaction *trans) {
     if (!WCMD_MERGE_PRI_EN || WCMD_MERGE_EN) return false;
     if (trans == NULL) return false;
     if (trans->transactionType != DATA_WRITE) return false;
-    if (!trans->mergeflag) return false;
+    if (!BYPASS_MERGEFLAG && !trans->mergeflag) return false;
     if (trans->mask_wcmd) return false;
     if (trans->ecc_flag) return false;
     return ((trans->burst_length + 1) * DMC_DATA_BUS_BITS / 8) == 128;
@@ -42,7 +42,6 @@ MemoryController::MemoryController(MemorySystem *parent, ostream &DDRSim_log_,
     trace_prefix = "LPTOP" + std::to_string(parentMemorySystem->systemID) + "_DMC" +
             std::to_string(sub_cha) + "_";
     trace_cmd_in_valid = false;
-    trace_cmd_in_accept = false;
     trace_wdata_in_valid = false;
     trace_dfi_cmd_fire = false;
     trace_dfi_wdata_valid = false;
@@ -73,6 +72,8 @@ MemoryController::MemoryController(MemorySystem *parent, ostream &DDRSim_log_,
     baconf_cnt = 0;
     totalconf_cnt = 0;
     active_cnt = 0;
+    read_active_cnt = 0;
+    write_active_cnt = 0;
     active_dst_cnt = 0;
     precharge_sb_cnt = 0;
     precharge_pb_cnt = 0;
@@ -5757,6 +5758,11 @@ void MemoryController::scheduler() {
             }
 
             active_cnt++;
+            if (c->type == DATA_READ) {
+                read_active_cnt++;
+            } else if (c->type == DATA_WRITE) {
+                write_active_cnt++;
+            }
             active_cmd_cnt[c->bankIndex] ++;
             access_bank_delay[c->bankIndex].enable = false;
             access_bank_delay[c->bankIndex].cnt = 0;
@@ -9218,7 +9224,6 @@ void MemoryController::update_deque_fifo() {
 
 void MemoryController::traceRegister() {
     TRACE_ADD(trace_prefix + "CMD_IN_VALID", 1);
-    TRACE_ADD(trace_prefix + "CMD_IN_ACCEPT", 1);
     TRACE_ADD(trace_prefix + "CMD_IN_TYPE", 1);
     TRACE_ADD(trace_prefix + "CMD_IN_TASK", 64);
     TRACE_ADD(trace_prefix + "CMD_IN_ADDRESS", 64);
@@ -9273,7 +9278,6 @@ void MemoryController::traceRegister() {
 
 void MemoryController::traceSample() {
     TRACE_LOG(trace_prefix + "CMD_IN_VALID", trace_cmd_in_valid);
-    TRACE_LOG(trace_prefix + "CMD_IN_ACCEPT", trace_cmd_in_accept);
     TRACE_LOG(trace_prefix + "CMD_IN_TYPE", trace_cmd_in_type);
     TRACE_LOG(trace_prefix + "CMD_IN_TASK", trace_cmd_in_task);
     TRACE_LOG(trace_prefix + "CMD_IN_ADDRESS", trace_cmd_in_address);
@@ -9339,7 +9343,6 @@ void MemoryController::traceSample() {
     }
 #endif
     trace_cmd_in_valid = false;
-    trace_cmd_in_accept = false;
     trace_wdata_in_valid = false;
     trace_dfi_cmd_fire = false;
     trace_dfi_wdata_valid = false;
@@ -9370,19 +9373,18 @@ bool MemoryController::push_req(Transaction * trans) {
 
     if (DROP_WRITE_CMD && trans->transactionType != DATA_READ) {
         pos = true;
+    } else if ((RMW_ENABLE || WCMD_MERGE_EN) && !trans->pre_act) {
+        pos = rmw->addTransaction(trans);
     } else if (IECC_ENABLE && (!IECC_PARTIAL_BYPASS || trans->address < IECC_BYPASS_ADDRESS) && !trans->pre_act) {
         pos = iecc->addTransaction(trans);
     } else if (WRITE_BUFFER_ENABLE && !trans->pre_act) {
         pos = wb->addTransaction(trans);
-//    } else if (RMW_ENABLE && !trans->pre_act) {
-//        pos = rmw->addTransaction(trans);
     } else {
         pos = addTransaction(trans);
     }
 
     if (pos) {
         trace_cmd_in_valid = true;
-        trace_cmd_in_accept = true;
         trace_cmd_in_type = trans->transactionType;
         trace_cmd_in_task = trans->task;
         trace_cmd_in_address = trans->address;
