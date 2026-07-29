@@ -115,6 +115,8 @@ MemorySystem::MemorySystem(unsigned dmcId,unsigned hhaId, ostream &DDRSim_log_,s
     pre_timeout_cnt = 0;
     pre_rt_timeout_cnt = 0;
     pre_row_hit_cnt = 0;
+    pre_read_row_hit_cnt = 0;
+    pre_write_row_hit_cnt = 0;
     pre_row_miss_cnt = 0;
     pre_rw_switch_cnt = 0;
     pre_rank_switch_cnt = 0;
@@ -1397,28 +1399,31 @@ void MemorySystem::statistics() {
     }
 
     STATE_PRINTN("-------------------- Request Statistics (DDR Command Number) --------------------------\n");
-    uint64_t total_cas_cnt = 0;
+    uint64_t read_cas_cnt = 0;
+    uint64_t write_cas_cnt = 0;
 
     // 判断位宽，动态调整统计粒度
     if (JEDEC_DATA_BUS_BITS == 16) {
         // 以 32B (1 CAS) 为粒度统计
-        total_cas_cnt = 
-            (memoryController->TotalDmcRd32B + memoryController->TotalDmcWr32B) * 1 +
-            (memoryController->TotalDmcRd64B + memoryController->TotalDmcWr64B) * 2 +
-            (memoryController->TotalDmcRd128B + memoryController->TotalDmcWr128B) * 4 +
-            (memoryController->TotalDmcRd256B + memoryController->TotalDmcWr256B) * 8;
+        read_cas_cnt = memoryController->TotalDmcRd32B + memoryController->TotalDmcRd64B * 2
+                + memoryController->TotalDmcRd128B * 4 + memoryController->TotalDmcRd256B * 8;
+        write_cas_cnt = memoryController->TotalDmcWr32B + memoryController->TotalDmcWr64B * 2
+                + memoryController->TotalDmcWr128B * 4 + memoryController->TotalDmcWr256B * 8;
     } else {
         // 默认以 64B (1 CAS) 为粒度统计 (即 JEDEC_DATA_BUS_BITS == 32)
         // 注意：32B 请求依然占用 1 个完整的 CAS 命令 (Burst 长度固定)
-        total_cas_cnt = 
-            (memoryController->TotalDmcRd32B + memoryController->TotalDmcWr32B) * 1 +
-            (memoryController->TotalDmcRd64B + memoryController->TotalDmcWr64B) * 1 +
-            (memoryController->TotalDmcRd128B + memoryController->TotalDmcWr128B) * 2 +
-            (memoryController->TotalDmcRd256B + memoryController->TotalDmcWr256B) * 4;
+        read_cas_cnt = memoryController->TotalDmcRd32B + memoryController->TotalDmcRd64B
+                + memoryController->TotalDmcRd128B * 2 + memoryController->TotalDmcRd256B * 4;
+        write_cas_cnt = memoryController->TotalDmcWr32B + memoryController->TotalDmcWr64B
+                + memoryController->TotalDmcWr128B * 2 + memoryController->TotalDmcWr256B * 4;
     }
 
     // Hit 统计逻辑：(总读写命令数) 减去 (激活命令数) 剩下的就是命中的命令数
-    row_hit_cnt = (total_cas_cnt > act_cnt) ? (total_cas_cnt - act_cnt) : 0;
+    uint64_t read_row_hit_cnt = read_cas_cnt > memoryController->read_active_cnt
+            ? read_cas_cnt - memoryController->read_active_cnt : 0;
+    uint64_t write_row_hit_cnt = write_cas_cnt > memoryController->write_active_cnt
+            ? write_cas_cnt - memoryController->write_active_cnt : 0;
+    row_hit_cnt = read_row_hit_cnt + write_row_hit_cnt;
     row_miss_cnt = act_cnt;
 
     STATE_PRINTN(setw(36)<<"Active cnt"<<" : "<<setw(12)<<act_cnt - pre_act_cnt);
@@ -1447,6 +1452,10 @@ void MemorySystem::statistics() {
     STATE_PRINTN(" | "<<setw(36)<<"Total mask write with AP"<<" : "<<mwrite_p_cnt<<endl);
     STATE_PRINTN(setw(36)<<"Row hit"<<" : "<<setw(12)<<row_hit_cnt - pre_row_hit_cnt);
     STATE_PRINTN(" | "<<setw(36)<<"Total row hit"<<" : "<<row_hit_cnt<<endl);
+    STATE_PRINTN(setw(36)<<"Read row hit"<<" : "<<setw(12)<<read_row_hit_cnt - pre_read_row_hit_cnt);
+    STATE_PRINTN(" | "<<setw(36)<<"Total read row hit"<<" : "<<read_row_hit_cnt<<endl);
+    STATE_PRINTN(setw(36)<<"Write row hit"<<" : "<<setw(12)<<write_row_hit_cnt - pre_write_row_hit_cnt);
+    STATE_PRINTN(" | "<<setw(36)<<"Total write row hit"<<" : "<<write_row_hit_cnt<<endl);
     STATE_PRINTN(setw(36)<<"Row miss cnt"<<" : "<<setw(12)<<row_miss_cnt - pre_row_miss_cnt);
     STATE_PRINTN(" | "<<setw(36)<<"Total row miss cnt"<<" : "<<row_miss_cnt<<endl);
     STATE_PRINTN(setw(36)<<"ecc read cnt"<<" : "<<setw(12)<<ecc_read_cnt - pre_ecc_read_cnt);
@@ -1871,6 +1880,8 @@ void MemorySystem::statistics() {
     pre_timeout_cnt = timeout_cnt;
     pre_rt_timeout_cnt = rt_timeout_cnt;
     pre_row_hit_cnt = row_hit_cnt;
+    pre_read_row_hit_cnt = read_row_hit_cnt;
+    pre_write_row_hit_cnt = write_row_hit_cnt;
     pre_row_miss_cnt = row_miss_cnt;
     pre_ecc_read_cnt = ecc_read_cnt;
     pre_ecc_write_cnt = ecc_write_cnt;
