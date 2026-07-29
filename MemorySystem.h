@@ -175,6 +175,8 @@ public:
     unsigned pre_timeout_cnt;
     unsigned pre_rt_timeout_cnt;
     unsigned pre_row_hit_cnt;
+    unsigned pre_read_row_hit_cnt;
+    unsigned pre_write_row_hit_cnt;
     unsigned pre_row_miss_cnt;
     unsigned pre_rw_switch_cnt;
     unsigned pre_rank_switch_cnt;
