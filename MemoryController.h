@@ -276,6 +276,8 @@ public:
     unsigned baconf_cnt;
     unsigned totalconf_cnt;
     unsigned active_cnt;
+    unsigned read_active_cnt;
+    unsigned write_active_cnt;
     unsigned active_dst_cnt;
     unsigned precharge_sb_cnt;
     unsigned precharge_pb_cnt;
@@ -520,7 +522,6 @@ private:
     bool rcmd_bp_byrp;
     string trace_prefix;
     bool trace_cmd_in_valid;
-    bool trace_cmd_in_accept;
     TransactionType trace_cmd_in_type;
     uint64_t trace_cmd_in_task;
     uint64_t trace_cmd_in_address;
