@@ -56,6 +56,7 @@ Rmw::Rmw(MemoryController *_top, unsigned id, ostream &DDRSim_log_) :
     totalMaskWrites = 0; 
     totalTransactions = 0; 
     merge_candidates = 0;
+    merge_candidate_cmds = 0;
     merge_pairs = 0;
     merge_unpaired_flushes = 0;
     merge_remap_beats = 0;
@@ -225,7 +226,7 @@ bool Rmw::address_conf(Transaction *t, Transaction *cmd) {
 
 bool Rmw::is_write_merge_candidate(const Transaction *trans) const {
     if (trans == NULL || !WCMD_MERGE_EN || trans->transactionType != DATA_WRITE) return false;
-    if (!trans->mergeflag || trans->mask_wcmd || trans->ecc_flag) return false;
+    if ((!BYPASS_MERGEFLAG && !trans->mergeflag) || trans->mask_wcmd || trans->ecc_flag) return false;
     return ((trans->burst_length + 1) * DMC_DATA_BUS_BITS / 8) == 128;
 }
 
@@ -234,6 +235,20 @@ bool Rmw::can_merge_write_pair(const Transaction *first, const Transaction *seco
     uint64_t low_addr = std::min(first->address, second->address);
     uint64_t high_addr = std::max(first->address, second->address);
     return first->channel == second->channel && ((low_addr ^ high_addr) == 128) && ((low_addr & 127) == 0);
+}
+
+unsigned Rmw::transaction_slots(const Transaction *trans) const {
+    return std::max(1u, (trans->data_size + 127) / 128);
+}
+
+unsigned Rmw::rmw_slot_cnt() const {
+    unsigned slots = 0;
+    for (const auto trans : RmwQue) slots += transaction_slots(trans);
+    return slots;
+}
+
+bool Rmw::has_rmw_slots(unsigned slots) const {
+    return RMW_QUE_DEPTH == 0 || rmw_slot_cnt() + slots <= RMW_QUE_DEPTH;
 }
 
 Transaction *Rmw::build_merged_write_transaction(Transaction *first, Transaction *second, uint64_t merged_task, bool mask_wcmd) {
@@ -255,6 +270,8 @@ bool Rmw::handle_write_merge_transaction(Transaction *trans) {
     for (size_t i = 0; i < RmwQue.size(); i++) {
         Transaction *first = RmwQue[i];
         if (!can_merge_write_pair(first, trans)) continue;
+        unsigned merged_slots = transaction_slots(first) + transaction_slots(trans);
+        if (!has_rmw_slots(merged_slots - transaction_slots(first))) return false;
         unsigned first_beats = first->burst_length + 1;
         unsigned second_ready = 0;
         auto pending = pending_write_data_cnt.find(trans->task);
@@ -275,6 +292,7 @@ bool Rmw::handle_write_merge_transaction(Transaction *trans) {
                     first_beats - first->data_ready_cnt));
         }
         write_merge_first_resp_task[second_task] = first_task;
+        merge_candidate_cmds++;
         merge_pairs++;
         if (RMW_CMD_MODE == 1 && top->parentMemorySystem) {
             auto first_map = top->parentMemorySystem->write_map.find(first_task);
@@ -292,8 +310,8 @@ bool Rmw::handle_write_merge_transaction(Transaction *trans) {
         rebuild_conflict_state();
         return true;
     }
-    bool rmw_que_full = rmw_cmd_cnt >= RMW_QUE_DEPTH && RMW_QUE_DEPTH != 0;
-    if (rmw_que_full) return false;
+    if (!has_rmw_slots(transaction_slots(trans))) return false;
+    merge_candidate_cmds++;
     auto pending = pending_write_data_cnt.find(trans->task);
     if (pending != pending_write_data_cnt.end()) {
         trans->data_ready_cnt = std::min(pending->second, trans->burst_length + 1);
@@ -323,6 +341,8 @@ void Rmw::rebuild_conflict_state() {
         conf->task = RmwQue[i]->task;
         for (size_t j = 0; j < i; j++) {
             if (RmwQue[i]->channel == RmwQue[j]->channel
+                    && RmwQue[i]->bankIndex == RmwQue[j]->bankIndex
+                    && RmwQue[i]->row == RmwQue[j]->row
                     && !(RmwQue[i]->transactionType == DATA_READ && RmwQue[j]->transactionType == DATA_READ)
                     && address_conf(RmwQue[i], RmwQue[j])) conf->ad_conf_cnt++;
         }
@@ -491,7 +511,7 @@ bool Rmw::addTransaction(Transaction * trans) {
 
 
 //    uint8_t ch = trans->channel;
-    bool rmw_que_full  = rmw_cmd_cnt >= RMW_QUE_DEPTH && RMW_QUE_DEPTH != 0;
+    bool rmw_que_full  = !has_rmw_slots(transaction_slots(trans));
     bool rmw_que_empty = rmw_cmd_cnt == 0;
 
     if (is_write_merge_candidate(trans)) {
@@ -1004,11 +1024,12 @@ void Rmw::statistics() {
     state_log << "Bypass writes            : " << totalBypassWrites << endl;
     state_log << "Total transactions       : " << totalTransactions << endl;
     state_log << "WCMD merge candidates    : " << merge_candidates << endl;
+    state_log << "WCMD merge candidate cmds: " << merge_candidate_cmds << endl;
     state_log << "WCMD merge pairs         : " << merge_pairs << endl;
     state_log << "WCMD unpaired flushes    : " << merge_unpaired_flushes << endl;
     state_log << "WCMD merge remap beats   : " << merge_remap_beats << endl;
     state_log << "WCMD merge ratio         : " << fixed << setprecision(2)
-              << (merge_candidates == 0 ? 0.0 : static_cast<double>(merge_pairs * 2) * 100.0 / merge_candidates)
+              << (merge_candidate_cmds == 0 ? 0.0 : static_cast<double>(merge_pairs * 2) * 100.0 / merge_candidate_cmds)
               << "%" << endl;
     state_log << "=======================================================================================" << endl;
     state_log.flush();
