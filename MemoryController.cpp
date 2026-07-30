@@ -7384,10 +7384,14 @@ void MemoryController::que_pipeline() {
     for (auto &t : transactionQueue) {
         unsigned t_state = (t->rank << 1) | t->transactionType;
         unsigned sub_channel = (t->bankIndex % NUM_BANKS) / sc_bank_num;
+        bool cas_ready = t->transactionType == DATA_READ
+                ? !rcmd_bp_byrp
+                : t->data_ready_cnt >= t->burst_length + 1;
         if (t->addrconf) continue;
         if (t->pre_act) continue;
         if (now() < t->arb_time) continue;
         if (t->bp_by_tout) continue;
+        if (!cas_ready) continue;
         if (refreshALL[t->rank][sub_channel].refreshing) continue;    //todo: revise for e-mode
         //if (refreshPerBank[t->bankIndex].refreshing) continue;
         if (bankStates[t->bankIndex].state->currentBankState == RowActive &&
