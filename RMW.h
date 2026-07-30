@@ -73,7 +73,7 @@ class Rmw:public SimulatorObject {
     void arb_node();
     void send_wdata();
     unsigned rmw_cmd_cnt;
-    inline bool full() {return (rmw_cmd_cnt >= RMW_QUE_DEPTH);}
+    inline bool full() {return RMW_QUE_DEPTH != 0 && rmw_slot_cnt() >= RMW_QUE_DEPTH;}
     void func_check();
     void update_state();
 //    void trans_state_clr(Transaction *trans);
@@ -116,6 +116,7 @@ class Rmw:public SimulatorObject {
     unsigned totalMaskWrites; 
     unsigned totalTransactions;
     unsigned merge_candidates;
+    unsigned merge_candidate_cmds;
     unsigned merge_pairs;
     unsigned merge_unpaired_flushes;
     unsigned merge_remap_beats;
@@ -182,6 +183,9 @@ class Rmw:public SimulatorObject {
     bool has_queued_write_data(uint64_t task) const;
     void rebuild_conflict_state();
     bool is_unpaired_write_merge_timeout(Transaction *trans, cmd_state *state);
+    unsigned transaction_slots(const Transaction *trans) const;
+    unsigned rmw_slot_cnt() const;
+    bool has_rmw_slots(unsigned slots) const;
 
 //    public:
 //    unsigned push_cnt;
