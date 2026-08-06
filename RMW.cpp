@@ -60,6 +60,7 @@ Rmw::Rmw(MemoryController *_top, unsigned id, ostream &DDRSim_log_) :
     merge_pairs = 0;
     merge_unpaired_flushes = 0;
     merge_remap_beats = 0;
+    pdu_locality_streak = 0;
 //    pre_reads = 0; 
 //    pre_bypass_reads = 0; 
 //    pre_bypass_writes = 0; 
@@ -413,6 +414,50 @@ bool Rmw::has_queued_write_data(uint64_t task) const {
 bool Rmw::is_unpaired_write_merge_timeout(Transaction *trans, cmd_state *state) {
     return is_write_merge_candidate(trans) && WRITE_MERGE_TIMEOUT != 0
             && now() - state->rmwTimeAdded >= WRITE_MERGE_TIMEOUT;
+}
+
+bool Rmw::is_arb_eligible(unsigned index, bool iecc_owned) {
+    if (now() < RmwQue[index]->arb_time) return false;
+    if (top->iecc->iecc_owner_valid && !iecc_owned) return false;
+    if (RmwConfCnt[index]->ad_conf_cnt != 0 && !iecc_owned) return false;
+    if (RmwCmdState[index]->rmwState == MERGE_READ && RmwQue[index]->mask_wcmd) return false;
+    bool merged_command = write_merge_first_resp_task.find(RmwQue[index]->task)
+            != write_merge_first_resp_task.end();
+    if (is_write_merge_candidate(RmwQue[index]) && !merged_command
+            && !is_unpaired_write_merge_timeout(RmwQue[index], RmwCmdState[index])) return false;
+    if (RmwQue[index]->transactionType == DATA_WRITE && !RmwQue[index]->mask_wcmd
+            && RMW_CMD_MODE == 1 && RmwCmdState[index]->rmwState != SEND_READY) return false;
+    if (RmwQue[index]->transactionType == DATA_WRITE && !RmwQue[index]->mask_wcmd
+            && RmwQue[index]->ecc_flag && RmwCmdState[index]->rmwState != SEND_READY) return false;
+    return true;
+}
+
+unsigned Rmw::select_arb_candidate(const std::vector<unsigned> &eligible) {
+    unsigned first = eligible.front();
+    if (!IECC_ENABLE || IECC_PDU_SCHED_MODE == 0 || top->iecc->iecc_owner_valid) {
+        pdu_locality_streak = 0;
+        return first;
+    }
+    if ((PDU_REORDER_MAX_AGE != 0
+            && now() - RmwCmdState[first]->rmwTimeAdded >= PDU_REORDER_MAX_AGE)
+            || (PDU_LOCALITY_BUDGET != 0 && pdu_locality_streak >= PDU_LOCALITY_BUDGET)) {
+        pdu_locality_streak = 0;
+        return first;
+    }
+    if (RmwQue[first]->transactionType == DATA_WRITE
+            && (top->iecc->probe_pdu(*RmwQue[first]).hit_result & 2) != 0) {
+        pdu_locality_streak = 0;
+        return first;
+    }
+    for (auto index : eligible) {
+        if (RmwQue[index]->qos != RmwQue[first]->qos) continue;
+        if (RmwQue[index]->transactionType != DATA_WRITE) continue;
+        if ((top->iecc->probe_pdu(*RmwQue[index]).hit_result & 2) == 0) continue;
+        pdu_locality_streak++;
+        return index;
+    }
+    pdu_locality_streak = 0;
+    return first;
 }
 
 bool Rmw::addData(uint32_t *data, uint64_t task) {
@@ -809,6 +854,7 @@ void Rmw::arb_node() {
     }
 
     unsigned size = RmwQue.size();
+    std::vector<unsigned> eligible;
     for (unsigned i = 0; i < size; i++) {
         if ((RmwQue[i]->transactionType == DATA_READ) && (RmwCmdState[i]->rmwState!=QUE_WAITING)){
             ERROR(setw(10)<<now()<<" -- Read Cmd State Wrong, task="<<RmwQue[i]->task<<" type="<<RmwQue[i]->transactionType<<" channel="<<RmwQue[i]->channel
@@ -816,6 +862,21 @@ void Rmw::arb_node() {
                    <<" rmw_mode="<<RMW_CMD_MODE);
             assert(0);
         }
+
+        bool iecc_owned = top->iecc->iecc_owner_valid
+                && RmwQue[i]->task == top->iecc->iecc_owner_task;
+        if (is_arb_eligible(i, iecc_owned)) eligible.push_back(i);
+    }
+    if (eligible.empty()) return;
+
+    unsigned selected = select_arb_candidate(eligible);
+    std::vector<unsigned> arb_order;
+    arb_order.push_back(selected);
+    for (auto index : eligible) {
+        if (index != selected) arb_order.push_back(index);
+    }
+
+    for (auto i : arb_order) {
 
         if (now() < RmwQue[i]->arb_time) { 
             continue;
