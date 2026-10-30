@@ -52,6 +52,10 @@ MemoryController::MemoryController(MemorySystem *parent, ostream &DDRSim_log_,
     cmdCyclesLeft = 0;
     //set here to avoid compile errors
     //reserve memory for vectors
+    if (MC_GROUP_LRU_EN && TRANS_QUEUE_DEPTH != 88) {
+        ERROR("MC_GROUP_LRU_EN requires TRANS_QUEUE_DEPTH=88");
+        abort();
+    }
     transactionQueue.reserve(TRANS_QUEUE_DEPTH);
     slt_valid.clear();
     //slt_valid.resize(TRANS_QUEUE_DEPTH);
@@ -3213,7 +3217,7 @@ void MemoryController::exec() {
                 static uint64_t pre_time = 0;
                 if (command.type == READ_CMD) {
                     PRINTN(setw(10)<<now()<<" -- EXEC :: send [READ_CMD] to DFI task="<<command.task<<" rank="<<command.rank
-                            <<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bankIndex<<" row="<<command.row
+                            <<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bank<<" bankIndex="<<command.bankIndex<<" row="<<command.row
                             <<" wcnt="<<que_write_cnt<<" rcnt="<<que_read_cnt<<" bl="<<command.bl<<" interval="<<(now()-pre_time));
                     for (size_t i = 0; i < NUM_RANKS; i ++) {
                         PRINTN(" R"<<i<<"R="<<+r_rank_cnt[i]<<" R"<<i<<"W="<<+w_rank_cnt[i]);
@@ -3222,7 +3226,7 @@ void MemoryController::exec() {
                     pre_time = now();
                 } else if (command.type == READ_P_CMD) {
                     PRINTN(setw(10)<<now()<<" -- EXEC :: send [READ_P_CMD] to DFI task="<<command.task<<" rank="<<command.rank
-                            <<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bankIndex<<" row="<<command.row
+                            <<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bank<<" bankIndex="<<command.bankIndex<<" row="<<command.row
                             <<" wcnt="<<que_write_cnt<<" rcnt="<<que_read_cnt<<" bl="<<command.bl<<" interval="<<(now()-pre_time));
                     for (size_t i = 0; i < NUM_RANKS; i ++) {
                         PRINTN(" R"<<i<<"R="<<+r_rank_cnt[i]<<" R"<<i<<"W="<<+w_rank_cnt[i]);
@@ -3231,13 +3235,13 @@ void MemoryController::exec() {
                     pre_time = now();
                 } else if (command.type == ACTIVATE1_CMD) {
                     PRINTN(setw(10)<<now()<<" -- EXEC :: send [ACTIVATE1_CMD] to DFI task="<<command.task<<" rank="<<command.rank
-                            <<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bankIndex<<" row="<<command.row<<endl);
+                            <<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bank<<" bankIndex="<<command.bankIndex<<" row="<<command.row<<endl);
                 } else if (command.type == ACTIVATE2_CMD) {
                     PRINTN(setw(10)<<now()<<" -- EXEC :: send [ACTIVATE2_CMD] to DFI task="<<command.task<<" rank="<<command.rank
-                            <<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bankIndex<<" row="<<command.row<<endl);
+                            <<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bank<<" bankIndex="<<command.bankIndex<<" row="<<command.row<<endl);
                 } else if (command.type == WRITE_CMD) {
                     PRINTN(setw(10)<<now()<<" -- EXEC :: send [WRITE_CMD] to DFI task="<<command.task<<" rank="<<command.rank
-                            <<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bankIndex<<" row="<<command.row
+                            <<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bank<<" bankIndex="<<command.bankIndex<<" row="<<command.row
                             <<" wcnt="<<que_write_cnt<<" rcnt="<<que_read_cnt<<" bl="<<command.bl<<" interval="<<(now()-pre_time));
                     for (size_t i = 0; i < NUM_RANKS; i ++) {
                         PRINTN(" R"<<i<<"R="<<+r_rank_cnt[i]<<" R"<<i<<"W="<<+w_rank_cnt[i]);
@@ -3246,7 +3250,7 @@ void MemoryController::exec() {
                     pre_time = now();
                 } else if (command.type == WRITE_P_CMD) {
                     PRINTN(setw(10)<<now()<<" -- EXEC :: send [WRITE_P_CMD] to DFI task="<<command.task<<" rank="<<command.rank
-                            <<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bankIndex<<" row="<<command.row
+                            <<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bank<<" bankIndex="<<command.bankIndex<<" row="<<command.row
                             <<" wcnt="<<que_write_cnt<<" rcnt="<<que_read_cnt<<" bl="<<command.bl<<" interval="<<(now()-pre_time));
                     for (size_t i = 0; i < NUM_RANKS; i ++) {
                         PRINTN(" R"<<i<<"R="<<+r_rank_cnt[i]<<" R"<<i<<"W="<<+w_rank_cnt[i]);
@@ -3255,7 +3259,7 @@ void MemoryController::exec() {
                     pre_time = now();
                 } else if (command.type == WRITE_MASK_CMD) {
                     PRINTN(setw(10)<<now()<<" -- EXEC :: send [WRITE_MASK_CMD] to DFI task="<<command.task<<" rank="<<command.rank
-                            <<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bankIndex<<" row="<<command.row
+                            <<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bank<<" bankIndex="<<command.bankIndex<<" row="<<command.row
                             <<" wcnt="<<que_write_cnt<<" rcnt="<<que_read_cnt<<" bl="<<command.bl<<" interval="<<(now()-pre_time));
                     for (size_t i = 0; i < NUM_RANKS; i ++) {
                         PRINTN(" R"<<i<<"R="<<+r_rank_cnt[i]<<" R"<<i<<"W="<<+w_rank_cnt[i]);
@@ -3264,7 +3268,7 @@ void MemoryController::exec() {
                     pre_time = now();
                 } else if (command.type == WRITE_MASK_P_CMD) {
                     PRINTN(setw(10)<<now()<<" -- EXEC :: send [WRITE_MASK_P_CMD] to DFI task="<<command.task<<" rank="<<command.rank
-                            <<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bankIndex<<" row="<<command.row
+                            <<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bank<<" bankIndex="<<command.bankIndex<<" row="<<command.row
                             <<" wcnt="<<que_write_cnt<<" rcnt="<<que_read_cnt<<" bl="<<command.bl<<" interval="<<(now()-pre_time));
                     for (size_t i = 0; i < NUM_RANKS; i ++) {
                         PRINTN(" R"<<i<<"R="<<+r_rank_cnt[i]<<" R"<<i<<"W="<<+w_rank_cnt[i]);
@@ -3273,10 +3277,10 @@ void MemoryController::exec() {
                     pre_time = now();
                 } else if (command.type == PRECHARGE_SB_CMD) {
                     PRINTN(setw(10)<<now()<<" -- EXEC :: send [PRECHARGE_SB_CMD] to DFI task="<<command.task<<" rank="
-                            <<command.rank<<" bank="<<command.bankIndex<<" row="<<command.row<<endl);
+                            <<command.rank<<" bank="<<command.bank<<" bankIndex="<<command.bankIndex<<" row="<<command.row<<endl);
                 } else if (command.type == PRECHARGE_PB_CMD) {
                     PRINTN(setw(10)<<now()<<" -- EXEC :: send [PRECHARGE_PB_CMD] to DFI task="<<command.task<<" rank="
-                            <<command.rank<<" sid="<<command.sid<<" bank="<<command.bankIndex<<" row="<<command.row<<endl);
+                            <<command.rank<<" sid="<<command.sid<<" bank="<<command.bank<<" bankIndex="<<command.bankIndex<<" row="<<command.row<<endl);
                 } else if (command.type == PRECHARGE_AB_CMD) {
                     PRINTN(setw(10)<<now()<<" -- EXEC :: send [PRECHARGE_AB_CMD] to DFI task="<<command.task<<" rank="
                             <<command.rank<<endl);
@@ -3285,13 +3289,13 @@ void MemoryController::exec() {
                             <<command.rank<<endl);
                 } else if (command.type == PER_BANK_REFRESH_CMD) {
                     PRINTN(setw(10)<<now()<<" -- EXEC :: send [PER_BANK_REFRESH_CMD] to DFI task="<<command.task<<" rank="
-                            <<command.rank<<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bankIndex<<endl);
+                            <<command.rank<<" sid="<<command.sid<<" group="<<command.group<<" bank="<<command.bank<<" bankIndex="<<command.bankIndex<<endl);
                 } else if (command.type == ACTIVATE1_DST_CMD) {
                     PRINTN(setw(10)<<now()<<" -- EXEC :: send [ACTIVATE1_DST_CMD] to DFI task="<<command.task<<" rank="
-                            <<command.rank<<" group="<<command.group<<" bank="<<command.bankIndex<<endl);
+                            <<command.rank<<" group="<<command.group<<" bank="<<command.bank<<" bankIndex="<<command.bankIndex<<endl);
                 } else if (command.type == ACTIVATE2_DST_CMD) {
                     PRINTN(setw(10)<<now()<<" -- EXEC :: send [ACTIVATE2_DST_CMD] to DFI task="<<command.task<<" rank="
-                            <<command.rank<<" group="<<command.group<<" bank="<<command.bankIndex<<endl);
+                            <<command.rank<<" group="<<command.group<<" bank="<<command.bank<<" bankIndex="<<command.bankIndex<<endl);
                 } else if (command.type == PRECHARGE_PB_DST_CMD) {
                     PRINTN(setw(10)<<now()<<" -- EXEC :: send [PRECHARGE_PB_DST_CMD] to DFI task="<<command.task<<" rank="
                             <<command.rank<<endl);
@@ -5147,7 +5151,9 @@ void MemoryController::scheduler() {
     }
 
     Cmd *c = NULL;
-    if (CORE_CONCURR == 1) {
+    if (CORE_CONCURR == 1 && MC_GROUP_LRU_EN) {
+        c = select_group_command(0);
+    } else if (CORE_CONCURR == 1) {
         for (auto &cmd : CmdQueue) {
             if (cmd->issue_size != 0) {c = cmd; break;}
             if (c == NULL) {c = cmd; continue;}
@@ -5202,7 +5208,9 @@ void MemoryController::scheduler() {
         if (now() % CORE_CONCURR_PRD != 0) {
             return;
         } else if (!core_concurr_en) { //send read/write command
-            for (auto &cmd : CmdQueue) {
+            if (MC_GROUP_LRU_EN) {
+                c = select_group_command(1);
+            } else for (auto &cmd : CmdQueue) {
                 if (cmd->cmd_type >= WRITE_CMD && cmd->cmd_type <= READ_P_CMD) {
                     if (cmd->issue_size != 0) {c = cmd; break;}
                     if (c == NULL) {c = cmd; continue;}
@@ -5218,7 +5226,9 @@ void MemoryController::scheduler() {
                 return;
             }
         } else { //send act/pre/ref/pbr and so on
-            for (auto &cmd : CmdQueue) {
+            if (MC_GROUP_LRU_EN) {
+                c = select_group_command(2);
+            } else for (auto &cmd : CmdQueue) {
                 if (cmd->cmd_type >= WRITE_CMD && cmd->cmd_type <= READ_P_CMD) continue;
                 if (c == NULL) {c = cmd; continue;}
                 if (priority(cmd) > priority(c)) {
@@ -5231,6 +5241,7 @@ void MemoryController::scheduler() {
         }
     }
 
+    if (c == NULL) return;
     arb_enable = false;
     if (c->cmd_type >= WRITE_CMD && c->cmd_type <= READ_P_CMD) {
         no_sch_cmd_en = true;
@@ -6193,7 +6204,7 @@ void MemoryController::scheduler() {
 
 
     // reorder arb group proority after one Cmd scheduled
-    if (c != NULL && !SLOT_FIFO && (((c->cmd_type >= WRITE_CMD && c->cmd_type <= READ_P_CMD)) || (c->cmd_type==activate_cmd))) {
+    if (c != NULL && !MC_GROUP_LRU_EN && !SLOT_FIFO && (((c->cmd_type >= WRITE_CMD && c->cmd_type <= READ_P_CMD)) || (c->cmd_type==activate_cmd))) {
         unsigned cmd_index = c->arb_group;
         if (DEBUG_BUS) {
             PRINTN(setw(10)<<now()<<" -- SCH CMD :: Arb Group="<<c->arb_group<<" task="<<c->task
@@ -6230,7 +6241,7 @@ void MemoryController::scheduler() {
         }
     }
 
-    if ((c!=NULL) && !SLOT_FIFO && c->cmd_type >= WRITE_CMD && c->cmd_type <= READ_P_CMD && c->issue_size + c->trans_size >= c->data_size) {
+    if ((c!=NULL) && !MC_GROUP_LRU_EN && !SLOT_FIFO && c->cmd_type >= WRITE_CMD && c->cmd_type <= READ_P_CMD && c->issue_size + c->trans_size >= c->data_size) {
         arb_group_cnt[c->arb_group]--;
         if (arb_group_cnt[c->arb_group] > 16) {
             ERROR(setw(10)<<now()<<" Wrong Arb Group Cnt, arb_group="<<c->arb_group<<", cnt="<<arb_group_cnt[c->arb_group]);
@@ -6238,7 +6249,10 @@ void MemoryController::scheduler() {
         }
     }
 
-    if (c != NULL) generate_packet(c);
+    if (c != NULL) {
+        generate_packet(c);
+        if (MC_GROUP_LRU_EN) update_group_lru(c);
+    }
     if (CORE_CONCURR == 1 || (CORE_CONCURR != 1 && !core_concurr_en)) {
         for (auto &cmd : CmdQueue) delete cmd;
         CmdQueue.clear();
@@ -7172,11 +7186,12 @@ void MemoryController::update_que() {
                 PRINTN(setw(10)<<now()<<" -- DELETE PRE_ACT:: task="<<t->task<<", bank="
                         <<t->bankIndex<<", row"<<t->row<<endl);
             }
+            if (MC_GROUP_LRU_EN) release_group_slot(t);
+            rank_pre_act_cnt[t->rank]--;
             t->reset();
             delete t;
             pre_act_cnt --;
             delete_cnt ++;
-            rank_pre_act_cnt[t->rank]--;
             transactionQueue.erase(transactionQueue.begin() + real_i);
         }
     }
@@ -7283,10 +7298,12 @@ void MemoryController::update_que() {
 
         if (ENH_PAGE_ADPT_EN && !t->has_send_act) bank_cnt_ehs[t->bankIndex] ++;
 
+        bool timed_out = t->timeout;
+        if (MC_GROUP_LRU_EN) release_group_slot(t);
         t->reset();
         delete t;
 
-        if (!SLOT_FIFO) {
+        if (!MC_GROUP_LRU_EN && !SLOT_FIFO) {
             unsigned slt_valid_cnt = 0;
             for (size_t j = 0; j < TRANS_QUEUE_DEPTH; j ++) {
                 if (!slt_valid[j]) continue;
@@ -7303,7 +7320,7 @@ void MemoryController::update_que() {
         dmc_cmd_cnt ++;
         rw_cmd_num ++;
         rw_group_rw_cmd_total++;
-        if (GRP_RANK_EN && !t->timeout && rk_grp_state != NO_RGRP) {
+        if (GRP_RANK_EN && !timed_out && rk_grp_state != NO_RGRP) {
             if (rk_grp_state == real_rk_grp_state) {
                 serial_cmd_cnt ++;
             } else {
@@ -7546,7 +7563,22 @@ void MemoryController::que_pipeline() {
     }
     
     uint64_t cmd_met_pbr_cnt = 0;
-    if (!SLOT_FIFO) {
+    if (MC_GROUP_LRU_EN) {
+        for (int group = 3; group >= 0; --group) {
+            for (unsigned slot = group * 22; slot < (group + 1) * 22; ++slot) {
+                Transaction *trans = group_slots[slot];
+                if (trans == nullptr) continue;
+                if (dfs_backpress_en) {
+                    trans->timeAdded++;
+                    continue;
+                }
+                if (arb_enable && now() >= trans->arb_time && even_cycle) lc(trans);
+                if ((refreshPerBank[trans->bankIndex].refreshWaiting || refreshPerBank[trans->bankIndex].refreshing)
+                        && trans->issue_size == 0 && !trans->act_executing) ++cmd_met_pbr_cnt;
+                if (trans->issue_size != 0) issue_state[trans->bankIndex] = true;
+            }
+        }
+    } else if (!SLOT_FIFO) {
         if (DEBUG_BUS) {
             PRINTN(setw(10)<<now()<<" -- Current Arb Group0 Priority="<<arb_group_pri[0]<<" -- Arb Group1 Priority="<<arb_group_pri[1]
                     <<" -- Arb Group2 Priority="<<arb_group_pri[2]<<" -- Arb Group3 Priority="<<arb_group_pri[3]<<endl);
@@ -7806,7 +7838,14 @@ void MemoryController::data_fresh() {
                     //return latency
                     if (msg.burst_cnt == (msg.burst_length + 1)) {
                         pending_TransactionQue.erase(task);
-                        if (IECC_ENABLE) tasks_info[task].rd_finish = true;
+                        if (IECC_ENABLE) {
+                            if (DEBUG_BUS) {
+                                PRINTN(setw(10)<<now()<<" -- PDU_RD_FINISH :: task="<<task
+                                        <<", rd_ecc="<<tasks_info[task].rd_ecc
+                                        <<endl);
+                            }
+                            tasks_info[task].rd_finish = true;
+                        }
                         if ((RMW_ENABLE || WCMD_MERGE_EN) && read_data_buffer[i].mask_wcmd==true) {
                             auto iter = rmw_rd_finish.find(task);
                             if (iter == rmw_rd_finish.end()){
@@ -7919,7 +7958,14 @@ void MemoryController::data_fresh() {
             //return latency
             if (msg.burst_cnt == (msg.burst_length + 1)) {
                 pending_TransactionQue.erase(task);
-                if (IECC_ENABLE) tasks_info[task].rd_finish = true;
+                if (IECC_ENABLE) {
+                    if (DEBUG_BUS) {
+                        PRINTN(setw(10)<<now()<<" -- PDU_RD_FINISH :: task="<<task
+                                <<", rd_ecc="<<tasks_info[task].rd_ecc
+                                <<endl);
+                    }
+                    tasks_info[task].rd_finish = true;
+                }
                 if ((RMW_ENABLE || WCMD_MERGE_EN) && return_rdata.mask_wcmd==true) {
                     auto iter = rmw_rd_finish.find(task);
                     if (iter == rmw_rd_finish.end()){
@@ -9017,12 +9063,115 @@ void MemoryController::lc(Transaction *t) {
     }
 }
 
+unsigned MemoryController::free_group_slots() {
+    unsigned count = 0;
+    for (size_t i = 0; i < group_slots.size(); ++i) {
+        if (group_slots[i] == nullptr && now() >= group_slot_ready[i]) ++count;
+    }
+    return count;
+}
+
+void MemoryController::bind_group_slot(Transaction *trans) {
+    for (int group = 3; group >= 0; --group) {
+        for (unsigned slot = group * 22; slot < (group + 1) * 22; ++slot) {
+            if (group_slots[slot] != nullptr || now() < group_slot_ready[slot]) continue;
+            group_slots[slot] = trans;
+            trans->arb_group = group;
+            ++arb_group_cnt[group];
+            if (DEBUG_BUS) {
+                PRINTN(setw(10)<<now()<<" -- GROUP_SLOT_ADD :: task="<<trans->task<<" slot="<<slot<<endl);
+            }
+            return;
+        }
+    }
+    assert(false);
+}
+
+void MemoryController::release_group_slot(Transaction *trans) {
+    for (size_t slot = 0; slot < group_slots.size(); ++slot) {
+        if (group_slots[slot] != trans) continue;
+        group_slots[slot] = nullptr;
+        group_slot_ready[slot] = now() + 1;
+        assert(arb_group_cnt[slot / 22] != 0);
+        --arb_group_cnt[slot / 22];
+        if (DEBUG_BUS) {
+            PRINTN(setw(10)<<now()<<" -- GROUP_SLOT_RELEASE :: task="<<trans->task<<" slot="<<slot<<endl);
+        }
+        return;
+    }
+    assert(false);
+}
+
+int MemoryController::command_group_slot(const Cmd *cmd) const {
+    if (cmd->cmd_source != 0) return -1;
+    for (size_t slot = 0; slot < group_slots.size(); ++slot) {
+        if (group_slots[slot] != nullptr && group_slots[slot]->task == cmd->task
+                && group_slots[slot]->pre_act == cmd->pre_act) return slot;
+    }
+    return -1;
+}
+
+Cmd *MemoryController::select_group_command(unsigned filter) {
+    std::array<Cmd *, 4> winners{};
+    std::array<int, 4> slots{{-1, -1, -1, -1}};
+    Cmd *internal = nullptr;
+    auto compare = [&](Cmd *a, Cmd *b) {
+        if (b == nullptr) return 1;
+        if (filter != 2 && (a->issue_size != 0 || b->issue_size != 0)) {
+            if (a->issue_size != 0 && b->issue_size == 0) return 1;
+            if (a->issue_size == 0 && b->issue_size != 0) return -1;
+        }
+        if (priority(a) != priority(b)) return priority(a) > priority(b) ? 1 : -1;
+        if (priority_pri(a) != priority_pri(b)) return priority_pri(a) < priority_pri(b) ? 1 : -1;
+        return 0;
+    };
+    for (auto cmd : CmdQueue) {
+        bool rw = cmd->cmd_type >= WRITE_CMD && cmd->cmd_type <= READ_P_CMD;
+        if ((filter == 1 && !rw) || (filter == 2 && rw)) continue;
+        int slot = command_group_slot(cmd);
+        if (slot < 0) {
+            if (compare(cmd, internal) > 0) internal = cmd;
+            continue;
+        }
+        unsigned group = slot / 22;
+        int result = compare(cmd, winners[group]);
+        if (result > 0 || (result == 0 &&
+                (group_slot_lru[slot] < group_slot_lru[slots[group]] ||
+                (group_slot_lru[slot] == group_slot_lru[slots[group]] && slot < slots[group])))) {
+            winners[group] = cmd;
+            slots[group] = slot;
+        }
+    }
+    Cmd *winner = nullptr;
+    int selected_group = -1;
+    for (int group = 3; group >= 0; --group) {
+        if (winners[group] == nullptr) continue;
+        int result = compare(winners[group], winner);
+        if (result > 0 || (result == 0 && group_lru[group] < group_lru[selected_group])) {
+            winner = winners[group];
+            selected_group = group;
+        }
+    }
+    if (internal != nullptr && compare(internal, winner) > 0) winner = internal;
+    return winner;
+}
+
+void MemoryController::update_group_lru(Cmd *cmd) {
+    int slot = command_group_slot(cmd);
+    if (slot < 0) return;
+    group_slot_lru[slot] = group_lru[slot / 22] = ++group_lru_clock;
+    if (DEBUG_BUS) {
+        PRINTN(setw(10)<<now()<<" -- GROUP_LRU_GRANT :: task="<<cmd->task<<" slot="<<slot
+                <<" priority="<<priority(cmd)<<" pri="<<priority_pri(cmd)<<endl);
+    }
+}
+
 bool MemoryController::WillAcceptTransaction() {
-    return GetDmcQsize() < TRANS_QUEUE_DEPTH;
+    return !full();
 }
 
 bool MemoryController::WillAcceptTransactions(unsigned num) {
-    return GetDmcQsize() + num <= TRANS_QUEUE_DEPTH;
+    return MC_GROUP_LRU_EN ? free_group_slots() >= num : GetDmcQsize() + num <= TRANS_QUEUE_DEPTH;
 }
 
 bool MemoryController::HasPendingWork() const {
@@ -9321,10 +9470,10 @@ void MemoryController::traceSample() {
     size_t trace_queue_level = std::min<size_t>(WAVE_QUEUE_LEVEL, TRANS_QUEUE_DEPTH);
     for (size_t i = 0; i < trace_queue_level; i++) {
         string slot = trace_prefix + "QUEUE" + std::to_string(i) + "_";
-        bool valid = i < transactionQueue.size();
+        bool valid = MC_GROUP_LRU_EN ? group_slots[i] != nullptr : i < transactionQueue.size();
         TRACE_LOG(slot + "VALID", valid);
         if (valid) {
-            Transaction *trans = transactionQueue[i];
+            Transaction *trans = MC_GROUP_LRU_EN ? group_slots[i] : transactionQueue[i];
             TRACE_LOG(slot + "TASK", trans->task);
             TRACE_LOG(slot + "TYPE", trans->transactionType);
             TRACE_LOG(slot + "BANK", trans->bankIndex);
@@ -9483,8 +9632,8 @@ bool MemoryController::refresh_backlog_blocks_external(const Transaction *trans)
 bool MemoryController::addTransaction(Transaction *trans) {
     if (pre_req_time == now()) return false;
     if (!full()) {
-        auto &state = bankStates[trans->bankIndex];
         trans_state_init(trans);
+        auto &state = bankStates[trans->bankIndex];
 
         if (refresh_backlog_blocks_external(trans)) {
             if (DEBUG_BUS) {
@@ -9518,6 +9667,10 @@ bool MemoryController::addTransaction(Transaction *trans) {
                 if(act_met){
                     trans->arb_time = now() + tCMD2SCH_BYPACT;
                 }
+            }
+            if (MC_GROUP_LRU_EN) {
+                bind_group_slot(trans);
+                pre_req_time = now();
             }
             transactionQueue.push_back(trans);
             rank_pre_act_cnt[trans->rank] ++;
@@ -9675,7 +9828,9 @@ bool MemoryController::addTransaction(Transaction *trans) {
 
         
         //label no of arb group for each tran in transactionQue
-        if (!SLOT_FIFO) {
+        if (MC_GROUP_LRU_EN) {
+            bind_group_slot(trans);
+        } else if (!SLOT_FIFO) {
             for (size_t grp_index = 0; grp_index < 4; grp_index ++) {
                 if(arb_group_cnt[grp_index] < 16) {
                     trans->arb_group = grp_index;
@@ -9811,15 +9966,6 @@ void MemoryController::update_even_cycle() {
 }
 
 void MemoryController::trans_state_init(Transaction *trans) {
-    if (FORCE_BAINTLV_EN) {
-        trans->rank = 0;
-        trans->group = trans->task % NUM_GROUPS;
-        trans->bank = trans->task / NUM_GROUPS % (NUM_BANKS / NUM_SIDS / NUM_GROUPS);
-        trans->sid = trans->task / (NUM_BANKS / NUM_SIDS) % NUM_SIDS;
-        trans->bankIndex = trans->bank + trans->group * (NUM_BANKS / NUM_SIDS / NUM_GROUPS) +
-                trans->rank * NUM_BANKS + trans->sid * (NUM_BANKS / NUM_SIDS);
-    }
-
     trans->timeAdded = now();
     trans->pri = trans->qos;
     trans->reqAddToDmcTime = now() * tDFI;
