@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <unordered_set>
 #include <unordered_map>
+#include <array>
 
 using namespace std;
 
@@ -258,6 +259,17 @@ public:
     //fields
     vector<Transaction *> transactionQueue;
     vector <bool> slt_valid;
+    std::array<Transaction *, 88> group_slots{};
+    std::array<uint64_t, 88> group_slot_ready{};
+    std::array<uint64_t, 88> group_slot_lru{};
+    std::array<uint64_t, 4> group_lru{};
+    uint64_t group_lru_clock = 0;
+    unsigned free_group_slots();
+    void bind_group_slot(Transaction *trans);
+    void release_group_slot(Transaction *trans);
+    int command_group_slot(const Cmd *cmd) const;
+    Cmd *select_group_command(unsigned filter);
+    void update_group_lru(Cmd *cmd);
     std::map< uint64_t,TRANS_MSG > pending_TransactionQue;
     BusPacket command;
     unsigned  command_pend;
@@ -395,13 +407,13 @@ public:
     unsigned que_read_cnt;
     unsigned que_write_cnt;
     unsigned dmc_cmd_cnt;
-    unsigned pre_act_cnt;
-    unsigned total_pre_act_cnt;
-    unsigned total_pre_act_success_cnt;
+    unsigned pre_act_cnt = 0;
+    unsigned total_pre_act_cnt = 0;
+    unsigned total_pre_act_success_cnt = 0;
     unsigned total_iecc_cnt;
     unsigned total_noiecc_cnt;
     std::vector<std::vector<BankState>> banktable;
-    bool full() {return ((que_read_cnt + que_write_cnt) >= TRANS_QUEUE_DEPTH);};
+    bool full() {return MC_GROUP_LRU_EN ? free_group_slots() == 0 : ((que_read_cnt + que_write_cnt) >= TRANS_QUEUE_DEPTH);};
     void dfs_backpress(bool backpress);
     bool dfs_backpress_en;
     uint64_t total_dfs_bp_cnt;
