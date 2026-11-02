@@ -63,7 +63,7 @@ public:
             double readDataEnterDmcTime, double reqAddToDmcTime, double reqEnterDmcBufTime);
     void ReturnData_statistics(uint64_t task, uint64_t timeAdded, unsigned qos, unsigned mid, unsigned pf_type, unsigned rank);
     void Cmd2Dfi_statistics(uint64_t task, uint64_t timeAdded, unsigned qos, unsigned mid, unsigned pf_type, unsigned rank);
-    void receiveFromBus(unsigned long long task, bool mask_wcmd, bool ps);
+    void receiveFromBus(unsigned long long task, bool mask_wcmd);
     void receiveFromCPU(unsigned *data ,uint64_t task);
     bool canReceiveWdata(uint64_t task) const;
     void attachRanks(vector<Rank *> *rank);
@@ -270,8 +270,10 @@ public:
     int command_group_slot(const Cmd *cmd) const;
     Cmd *select_group_command(unsigned filter);
     void update_group_lru(Cmd *cmd);
+    bool pdu_order_blocked(const Transaction *trans) const;
     std::map< uint64_t,TRANS_MSG > pending_TransactionQue;
     BusPacket command;
+    std::vector<uint64_t> command_pdu_keys;
     unsigned  command_pend;
     
     //even/odd cycle flag
@@ -591,7 +593,7 @@ public:
     void gen_cresp(uint64_t task);
     void gen_wresp(uint64_t task);
     void gen_rresp(uint64_t task);
-    void gen_rdata(uint64_t task, unsigned cnt, unsigned delay, bool mask_wcmd, bool ps);
+    void gen_rdata(uint64_t task, unsigned cnt, unsigned delay, bool mask_wcmd);
     void push_pending_TransactionQue(Transaction *trans);
     void rank_group_weight(unsigned * rank, unsigned * type);
     unsigned max_bl_data_size;
