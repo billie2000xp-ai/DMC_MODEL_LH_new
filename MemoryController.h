@@ -5249,14 +5249,22 @@ void MemoryController::scheduler() {
                 for (size_t i = 0; i < NUM_RANKS; i ++) {
                     DEBUGN(" R"<<i<<"R="<<+r_rank_cnt[i]<<" R"<<i<<"W="<<+w_rank_cnt[i]);
                 }
-                DEBUGN(" wcnt="<<que_write_cnt<<" rcnt="<<que_read_cnt<<endl);
+                DEBUGN(" wcnt="<<que_write_cnt<<" rcnt="<<que_read_cnt
+                        <<" phase=SCH task="<<c->task<<" timeout="<<c->timeout
+                        <<" local_group="<<+rw_group_state[0]<<" effective_group="<<+GetEffectiveRwGroup()
+                        <<" sync="<<rw_sync_group_valid<<" rank_group="<<GRP_RANK_EN
+                        <<" rw_group_en="<<GRP_RW_EN<<endl);
             }
             if (DEBUG_BUS) {
                 PRINTN(setw(10)<<now()<<" -- EXEC :: [RW_SWITCH] type="<<c->type<<" ser_rw_cnt="<<ser_rw_cnt);
                 for (size_t i = 0; i < NUM_RANKS; i ++) {
                     PRINTN(" R"<<i<<"R="<<+r_rank_cnt[i]<<" R"<<i<<"W="<<+w_rank_cnt[i]);
                 }
-                PRINTN(" wcnt="<<que_write_cnt<<" rcnt="<<que_read_cnt<<endl);
+                PRINTN(" wcnt="<<que_write_cnt<<" rcnt="<<que_read_cnt
+                        <<" phase=SCH task="<<c->task<<" timeout="<<c->timeout
+                        <<" local_group="<<+rw_group_state[0]<<" effective_group="<<+GetEffectiveRwGroup()
+                        <<" sync="<<rw_sync_group_valid<<" rank_group="<<GRP_RANK_EN
+                        <<" rw_group_en="<<GRP_RW_EN<<endl);
             }
             ser_rw_cnt = 0;
         }
@@ -5367,13 +5375,15 @@ void MemoryController::scheduler() {
                 (c->cmd_type == READ_CMD || c->cmd_type == READ_P_CMD)) {
             in_write_group = false;
             if (DEBUG_BUS) {
-                PRINTN(setw(10)<<now()<<" -- GRP_REAL :: Real Change to READ_GROUP"<<endl);
+                PRINTN(setw(10)<<now()<<" -- GRP_REAL :: Real Change to READ_GROUP"
+                        <<", reason=scheduled_read_in_local_read_group, task="<<c->task<<endl);
             }
         } else if (local_rw_group == WRITE_GROUP && !in_write_group && !c->timeout
                 && (c->cmd_type >= WRITE_CMD && c->cmd_type <= WRITE_MASK_P_CMD)) {
             in_write_group = true;
             if (DEBUG_BUS) {
-                PRINTN(setw(10)<<now()<<" -- GRP_REAL :: Real Change to WRITE_GROUP"<<endl);
+                PRINTN(setw(10)<<now()<<" -- GRP_REAL :: Real Change to WRITE_GROUP"
+                        <<", reason=scheduled_write_in_local_write_group, task="<<c->task<<endl);
             }
         }
         if (rw_sync_group_valid) {
@@ -6975,6 +6985,23 @@ void MemoryController::update_rwgroup_state() {
     bool stat_quc_rhit_high = HARDWARE_RHIT_EN && act_cmd_num <= RHIT_ACT_CMD_NUM;
     bool high_qos_trig = RCMD_HQOS_W2R_SWITCH_EN &&
             ((unsigned)accumulate(que_read_highqos_cnt.begin(), que_read_highqos_cnt.end(), 0) >= RCMD_HQOS_W2R_RLEVELH);
+    auto log_rw_change = [&](const char *transition, const string &reason) {
+        if (DEBUG_BUS) {
+            PRINTN(setw(10)<<now()<<" -- GRP_CHG :: "<<transition<<", reason="<<reason
+                    <<", Qsize="<<GetDmcQsize()<<", que_read_cnt="<<+que_read_cnt
+                    <<", que_write_cnt="<<+que_write_cnt
+                    <<", eligible_read="<<rw_schedulable_read_cnt
+                    <<", eligible_write="<<rw_schedulable_write_cnt
+                    <<", serial_cmd_cnt="<<+serial_cmd_cnt<<", rwgrp_ch_cmd_cnt="<<+rwgrp_ch_cmd_cnt
+                    <<", CMD_RLEVELL/H="<<CMD_RLEVELL<<"/"<<CMD_RLEVELH
+                    <<", CMD_WLEVELL/H="<<CMD_WLEVELL<<"/"<<CMD_WLEVELH
+                    <<", SERIAL_RLEVELL/H="<<SERIAL_RLEVELL<<"/"<<SERIAL_RLEVELH
+                    <<", SERIAL_WLEVELL/H="<<SERIAL_WLEVELL<<"/"<<SERIAL_WLEVELH
+                    <<", RLEVEL_R2W="<<RLEVEL_R2W<<", ALEVEL_W2R="<<ALEVEL_W2R
+                    <<", stat_quc_rhit_high="<<stat_quc_rhit_high
+                    <<", high_qos_trig="<<high_qos_trig<<endl);
+        }
+    };
     if (RCMD_HQOS_RANK_SWITCH_EN) {
         for (size_t i = 0; i < NUM_RANKS; i ++) {
             if (rank_cmd_high_qos[i]) rank_cmd_high_qos[i] = que_read_highqos_cnt[i] >= RCMD_HQOS_RANK_SWITCH_LEVELL;
@@ -6987,17 +7014,14 @@ void MemoryController::update_rwgroup_state() {
             if (GetDmcQsize() >= ENGRP_LEVEL) {
                 if (que_write_cnt >= CMD_WLEVELH || !has_read_cmd) {
                     rw_group_state.push_back(WRITE_GROUP);
-                    if (DEBUG_BUS) {
-                        PRINTN(setw(10)<<now()<<" -- GRP_CHG :: NG to WG, Qsize="<<GetDmcQsize()
-                                <<", =que_write_cnt"<<+que_write_cnt<<", has_read_cmd="<<has_read_cmd<<endl);
-                    }
+                    log_rw_change("NG to WG", string("enter_group(Qsize>=") + to_string(ENGRP_LEVEL) + ")"
+                            + (que_write_cnt >= CMD_WLEVELH ? "|write_high_waterline" : "")
+                            + (!has_read_cmd ? "|no_eligible_read" : ""));
                     in_write_group = false;
                 } else {
                     rw_group_state.push_back(READ_GROUP);
-                    if (DEBUG_BUS) {
-                        PRINTN(setw(10)<<now()<<" -- GRP_CHG :: NG to RG, Qsize="<<GetDmcQsize()
-                                <<", que_write_cnt="<<+que_write_cnt<<", has_read_cmd="<<has_read_cmd<<endl);
-                    }
+                    log_rw_change("NG to RG", string("enter_group(Qsize>=") + to_string(ENGRP_LEVEL)
+                            + ")|read_available_and_write_below_high_waterline");
                     in_write_group = true;
                 }
             }
@@ -7012,37 +7036,35 @@ void MemoryController::update_rwgroup_state() {
             }
             if (GetDmcQsize() < EXGRP_LEVEL && availability <= RWGRP_AUTO_BW) {
                 rw_group_state.push_back(NO_GROUP);
-                if (DEBUG_BUS) {
-                    PRINTN(setw(10)<<now()<<" -- GRP_CHG :: RG to NG, Qsize="<<GetDmcQsize()<<endl);
-                }
+                log_rw_change("RG to NG", string("exit_group(Qsize<") + to_string(EXGRP_LEVEL)
+                        + ",availability=" + to_string(availability) + "<=" + to_string(RWGRP_AUTO_BW) + ")");
                 serial_cmd_cnt = 0x0;
                 rwgrp_ch_cmd_cnt = 0x0;
             } else if (sch_tout_cmd && sch_tout_type != DATA_READ) { // Not used now
                 rw_group_state.push_back(WRITE_GROUP);
-                if (DEBUG_BUS) {
-                    PRINTN(setw(10)<<now()<<" -- GRP_CHG :: RG to WG by timeout command,"
-                            <<" serial_cmd_cnt="<<+serial_cmd_cnt<<", que_read_cnt="<<+que_read_cnt
-                            <<", que_write_cnt="<<+que_write_cnt<<endl);
-                }
+                log_rw_change("RG to WG", "timeout_write");
                 serial_cmd_cnt = 0x0;
                 rwgrp_ch_cmd_cnt = 0x0;
                 in_write_group = true;
             } else if (((serial_cmd_cnt >= SERIAL_RLEVELL && nonflat_r2w_pre) ||
                     serial_cmd_cnt >= SERIAL_RLEVELH || !has_read_cmd) && has_write_cmd && !high_qos_trig) {
                 rw_group_state.push_back(WRITE_GROUP);
-                if (DEBUG_BUS) {
-                    PRINTN(setw(10)<<now()<<" -- GRP_CHG :: RG to WG, serial_cmd_cnt="
-                            <<+serial_cmd_cnt<<", que_read_cnt="<<+que_read_cnt<<", que_write_cnt="
-                            <<+que_write_cnt<<", has_read_cmd="<<has_read_cmd<<", has_write_cmd="
-                            <<has_write_cmd<<endl);
+                string reason;
+                if (serial_cmd_cnt >= SERIAL_RLEVELL && nonflat_r2w_pre) {
+                    reason += (DMC_V580 || DMC_V590)
+                            ? (stat_quc_rhit_high ? "serial_min+read_low_waterline|"
+                                    : "serial_min+write_high_waterline+read_R2W_waterline|")
+                            : "serial_min+write_high_waterline|";
                 }
+                if (serial_cmd_cnt >= SERIAL_RLEVELH) reason += "serial_max|";
+                if (!has_read_cmd) reason += "no_eligible_read|";
+                log_rw_change("RG to WG", reason + "write_available");
                 serial_cmd_cnt = 0x0;
                 rwgrp_ch_cmd_cnt = 0x0;
                 in_write_group = false;
             } else if (in_write_group && rwgrp_ch_cmd_cnt >= RW_GRPCHG_W2R_TH && !high_qos_trig) {
-                if (DEBUG_BUS) {
-                    PRINTN(setw(10)<<now()<<" -- GRP_CHG :: RG rwgrp_ch_cmd_cnt="<<+rwgrp_ch_cmd_cnt<<endl);
-                }
+                log_rw_change("RG direction marker W to R", string("opposite_count>=RW_GRPCHG_W2R_TH=")
+                        + to_string(RW_GRPCHG_W2R_TH));
                 in_write_group = false;
                 rwgrp_ch_cmd_cnt = 0;
             }
@@ -7057,26 +7079,21 @@ void MemoryController::update_rwgroup_state() {
             }
             if (GetDmcQsize() < EXGRP_LEVEL && availability <= RWGRP_AUTO_BW) {
                 rw_group_state.push_back(NO_GROUP);
-                if (DEBUG_BUS) {
-                    PRINTN(setw(10)<<now()<<" -- GRP_CHG :: WG to NG, Qsize="<<GetDmcQsize()<<endl);
-                }
+                log_rw_change("WG to NG", string("exit_group(Qsize<") + to_string(EXGRP_LEVEL)
+                        + ",availability=" + to_string(availability) + "<=" + to_string(RWGRP_AUTO_BW) + ")");
                 serial_cmd_cnt = 0x0;
                 rwgrp_ch_cmd_cnt = 0x0;
             } else if (sch_tout_cmd && sch_tout_type == DATA_READ) { // Not used now
                 rw_group_state.push_back(READ_GROUP);
-                if (DEBUG_BUS) {
-                    PRINTN(setw(10)<<now()<<" -- GRP_CHG :: WG to RG by timeout command,"
-                            <<" serial_cmd_cnt="<<+serial_cmd_cnt<<", que_read_cnt="<<+que_read_cnt
-                            <<", que_write_cnt="<<+que_write_cnt<<endl);
-                }
+                log_rw_change("WG to RG", "timeout_read");
                 serial_cmd_cnt = 0x0;
                 rwgrp_ch_cmd_cnt = 0x0;
                 in_write_group = false;
             } else if (high_qos_trig && has_read_cmd) {
                 rw_group_state.push_back(READ_GROUP);
-                if (DEBUG_BUS) {
-                    PRINTN(setw(10)<<now()<<" -- GRP_CHG :: WG to RG, high qos trigger, high_qos_trig="<<high_qos_trig<<endl);
-                }
+                log_rw_change("WG to RG", string("high_qos_read(count=")
+                        + to_string(accumulate(que_read_highqos_cnt.begin(), que_read_highqos_cnt.end(), 0))
+                        + ">=" + to_string(RCMD_HQOS_W2R_RLEVELH) + ")");
                 serial_cmd_cnt = 0x0;
                 rwgrp_ch_cmd_cnt = 0x0;
                 in_write_group = true;
@@ -7084,19 +7101,27 @@ void MemoryController::update_rwgroup_state() {
             } else if (((serial_cmd_cnt >= SERIAL_WLEVELL && nonflat_w2r_pre) ||
                     serial_cmd_cnt >= SERIAL_WLEVELH || !has_write_cmd) && has_read_cmd) {
                 rw_group_state.push_back(READ_GROUP);
-                if (DEBUG_BUS) {
-                    PRINTN(setw(10)<<now()<<" -- GRP_CHG :: WG to RG, serial_cmd_cnt="
-                            <<+serial_cmd_cnt<<", que_read_cnt="<<+que_read_cnt<<", que_write_cnt="
-                            <<+que_write_cnt<<", has_read_cmd="<<has_read_cmd<<", has_write_cmd="
-                            <<has_write_cmd<<endl);
+                string reason;
+                if (serial_cmd_cnt >= SERIAL_WLEVELL && nonflat_w2r_pre) {
+                    if ((DMC_V580 || DMC_V590) && stat_quc_rhit_high) {
+                        reason += "serial_min+read_high_waterline|";
+                    } else {
+                        if (que_write_cnt <= CMD_WLEVELL) reason += "serial_min+write_low_waterline|";
+                        if ((DMC_V580 || DMC_V590) && (IS_HBM2E || IS_HBM3)
+                                && (que_read_cnt + que_write_cnt) <= ALEVEL_W2R) {
+                            reason += "serial_min+HBM_total_low_waterline|";
+                        }
+                    }
                 }
+                if (serial_cmd_cnt >= SERIAL_WLEVELH) reason += "serial_max|";
+                if (!has_write_cmd) reason += "no_eligible_write|";
+                log_rw_change("WG to RG", reason + "read_available");
                 serial_cmd_cnt = 0x0;
                 rwgrp_ch_cmd_cnt = 0x0;
                 in_write_group = true;
             } else if (!in_write_group && rwgrp_ch_cmd_cnt >= RW_GRPCHG_R2W_TH) {
-                if (DEBUG_BUS) {
-                    PRINTN(setw(10)<<now()<<" -- GRP_CHG :: WG rwgrp_ch_cmd_cnt="<<+rwgrp_ch_cmd_cnt<<endl);
-                }
+                log_rw_change("WG direction marker R to W", string("opposite_count>=RW_GRPCHG_R2W_TH=")
+                        + to_string(RW_GRPCHG_R2W_TH));
                 in_write_group = true;
                 rwgrp_ch_cmd_cnt = 0;
             }
@@ -8108,7 +8133,8 @@ void MemoryController::generate_packet(Cmd *c) {
         case READ_CMD :
         case READ_P_CMD : {
             if (c->cmd_type == READ_P_CMD && c->fg_ref) command_pend = pre_cycle;
-            else if (!RankState[c->rank].wck_on) command_pend = rw_cycle * 2;
+            else if (!WCK_ALWAYS_ON && !RankState[c->rank].wck_on)
+                command_pend = rw_cycle * 2;
             else command_pend = rw_cycle;
             TotalBytes += unsigned(PAM_RATIO * DmcLog2(c->bl, JEDEC_DATA_BUS_BITS)) / 8;
             flowStatisTotalBytes += unsigned(PAM_RATIO * DmcLog2(c->bl, JEDEC_DATA_BUS_BITS)) / 8;
@@ -8137,7 +8163,8 @@ void MemoryController::generate_packet(Cmd *c) {
         case WRITE_MASK_CMD :
         case WRITE_MASK_P_CMD : {
             if ((c->cmd_type == WRITE_P_CMD || c->cmd_type == WRITE_MASK_P_CMD) && c->fg_ref) command_pend = pre_cycle;
-            else if (!RankState[c->rank].wck_on) command_pend = rw_cycle * 2;
+            else if (!WCK_ALWAYS_ON && !RankState[c->rank].wck_on)
+                command_pend = rw_cycle * 2;
             else command_pend = rw_cycle;
             //create read or write command and enqueue it
             DataPacket dp;
