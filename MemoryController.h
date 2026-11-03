@@ -6960,6 +6960,7 @@ void MemoryController::update_rw_schedulable_counts() {
         unsigned sub_channel = (trans->bankIndex % NUM_BANKS) / sc_bank_num;
         if (trans->addrconf) continue;
         if (trans->pre_act) continue;
+        if (trans->issue_size >= trans->data_size) continue;
         if (pdu_order_blocked(trans)) continue;
         if (now() < trans->enter_que_time) continue;
         if (refreshALL[trans->rank][sub_channel].refreshing) continue;
@@ -7235,18 +7236,6 @@ void MemoryController::update_que() {
                 if (rw_sync_group_valid && rw_sync_group == WRITE_GROUP) rw_sync_ch_cmd_cnt++;
                 rw_group_read_retired_total++;
             }
-            //remove conflict
-            for (size_t j = i + 1; j < len; j++) {
-                Transaction *tmp = transactionQueue[j];
-//                if (tmp->task == t->task) continue;
-                if (tmp->addrconf && ((tmp->address & ~ALIGNED_SIZE) == (t->address & ~ALIGNED_SIZE)) &&
-                        tmp->transactionType != DATA_READ && (tmp->addr_block_source_id == t->task)) {
-                    tmp->addrconf = false;
-                    if (DEBUG_BUS) {
-                         PRINTN(setw(10)<<now()<<" -- RL_CONF :: release ,task="<<tmp->task<<endl);
-                    }
-                }
-            }
             if (t->qos <= SWITCH_HQOS_LEVEL) {
                 que_read_highqos_cnt[t->rank] --;
                 highqos_r_bank_cnt[t->bankIndex] --;
@@ -7275,20 +7264,9 @@ void MemoryController::update_que() {
             w_bank_cnt[t->bankIndex] --;
             w_bg_cnt[t->rank][t->group] --;
             w_sid_cnt[t->rank][t->sid] --;
-            //remove conflict
-            for (size_t j = i + 1; j < len; j++) {
-                Transaction *tmp = transactionQueue[j];
-//                if (tmp->task == t->task) continue;
-                if (tmp->addrconf && ((tmp->address & ~ALIGNED_SIZE) == (t->address & ~ALIGNED_SIZE))
-                        && (tmp->addr_block_source_id == t->task)) {
-                    tmp->addrconf = false;
-                    if (DEBUG_BUS) {
-                         PRINTN(setw(10)<<now()<<" -- RL_CONF :: release ,task="<<tmp->task<<endl);
-                    }
-                }
-            }
         }
 
+        release_conflicts(t);
         if (RHIT_BREAK_EN && bankStates[t->bankIndex].row_miss_cnt != 0) bankStates[t->bankIndex].ser_rhit_cnt ++;
         if (WRITE_BUFFER_ENABLE) wb->dmc_release_conflict(t);
         if (DEBUG_BUS) {
@@ -8581,6 +8559,18 @@ descriptor: timing check
 void MemoryController::lc(Transaction *t) {
     unsigned sub_channel = (t->bankIndex % NUM_BANKS) / sc_bank_num;
     unsigned bank_start = sub_channel * sc_bank_num;
+    if (t->addrconf) {
+        if (DEBUG_BUS) {
+            PRINTN(setw(10)<<now()<<" -- LC :: addr conflict. task="<<t->task<<endl);
+        }
+        return;
+    }
+    if (!t->act_executing && pdu_order_blocked(t)) {
+        if (DEBUG_BUS) {
+            PRINTN(setw(10)<<now()<<" -- PDU_ORDER_BP :: task="<<t->task<<" pdu_tag="<<t->pdu_tag<<endl);
+        }
+        return;
+    }
     if (t->pre_act && bankStates[t->bankIndex].state->currentBankState == RowActive) {
         t->issue_size = t->data_size;
         if (DEBUG_BUS) {
@@ -8685,13 +8675,6 @@ void MemoryController::lc(Transaction *t) {
        return;
     }
 
-    if (t->addrconf) {
-        if (DEBUG_BUS) {
-            PRINTN(setw(10)<<now()<<" -- LC :: addr conflict. task="<<t->task<<endl);
-        }
-        return;
-    }
-
     if (t->transactionType==DATA_READ && t->issue_size == 0 && rcmd_bp_byrp) {
         if (DEBUG_BUS) {
             PRINTN(setw(10)<<now()<<" -- LC :: backpress by rpram, task="<<t->task<<endl);
@@ -8704,13 +8687,6 @@ void MemoryController::lc(Transaction *t) {
     }
 
     need_issue(t);
-
-    if (t->nextCmd >= WRITE_CMD && t->nextCmd <= READ_P_CMD && pdu_order_blocked(t)) {
-        if (DEBUG_BUS) {
-            PRINTN(setw(10)<<now()<<" -- PDU_ORDER_BP :: task="<<t->task<<" pdu_tag="<<t->pdu_tag<<endl);
-        }
-        return;
-    }
 
     if (dresp_cnt >= DRESP_BP_TH && t->nextCmd >= WRITE_CMD && t->nextCmd <= READ_P_CMD
             && t->issue_size == 0) {
@@ -9207,18 +9183,51 @@ bool MemoryController::HasPendingWork() const {
 /***************************************************************************************************
 descriptor: check conflict,The purpose of this approach is to keep order
 ****************************************************************************************************/
+bool MemoryController::physical_address_conflict(const Transaction *a, const Transaction *b) {
+    if (a->pre_act || b->pre_act || a->bankIndex != b->bankIndex || a->row != b->row
+            || (a->transactionType == DATA_READ && b->transactionType == DATA_READ)) return false;
+    uint64_t bytes_per_col = (IS_LP6 ? 16 : JEDEC_DATA_BUS_BITS) / 8;
+    uint64_t a_begin = uint64_t(a->col) * bytes_per_col;
+    uint64_t b_begin = uint64_t(b->col) * bytes_per_col;
+    return a_begin < b_begin + b->data_size && b_begin < a_begin + a->data_size;
+}
+
+void MemoryController::release_conflicts(const Transaction *retiring) {
+    bool younger = false;
+    for (auto trans : transactionQueue) {
+        if (trans == retiring) {
+            younger = true;
+            continue;
+        }
+        if (!younger || !trans->addrconf || trans->addr_block_source_id != retiring->task) continue;
+        trans->addrconf = false;
+        trans->addr_block_source_id = 0;
+        for (auto older : transactionQueue) {
+            if (older == trans) break;
+            if (older != retiring && physical_address_conflict(trans, older)) {
+                trans->addrconf = true;
+                trans->addr_block_source_id = older->task;
+            }
+        }
+        if (!trans->addrconf && DEBUG_BUS) {
+            PRINTN(setw(10)<<now()<<" -- RL_CONF :: release ,task="<<trans->task<<endl);
+        }
+    }
+}
+
 void MemoryController::check_conflict(Transaction *trans) {
+    trans->addrconf = false;
+    trans->addr_block_source_id = 0;
     for (auto &t : transactionQueue) {
-        if (((trans->address & ~ALIGNED_SIZE) == (t->address & ~ALIGNED_SIZE))
-                && (!t->pre_act) && ((t->transactionType != DATA_READ && trans->transactionType == DATA_READ)
-                || (t->transactionType == DATA_READ && trans->transactionType != DATA_READ)
-                || (t->transactionType != DATA_READ && trans->transactionType != DATA_READ))) {
+        if (physical_address_conflict(trans, t)) {
             trans->addrconf = true;
             if (DEBUG_BUS) {
                     PRINTN(setw(10)<<now()<<" -- ADDR_CONF ::  task="<<trans->task<<" dst task="<<t->task
                             <<"type="<<trans->transactionType<<" dst type="<<t->transactionType
                             <<" qos="<<trans->qos<<" pri="
-                            <<trans->pri<<" Aligned_size="<<ALIGNED_SIZE<<endl);
+                            <<trans->pri<<" bank="<<trans->bankIndex<<" row="<<trans->row
+                            <<" col="<<trans->col<<" size="<<trans->data_size
+                            <<" dst_col="<<t->col<<" dst_size="<<t->data_size<<endl);
                 }
             addrconf_cnt++;
             if (trans->pri < t->pri && PRIORITY_PASS_ENABLE) {
