@@ -1,17 +1,3 @@
-/* $$$!!Warning: Huawei key information asset. No spread without permission.$$$ */
-/* CODEMARK:RKeR1B8WMAfemkt1tTDGp4eOEddgxKn4NOPmdw0w+6Q3n1pxgDEX+kGBiRV20e1NKuLwOh60qWwx
-7DOUvTqsDpJdC/G6ahMCQuRlwWqc+IFZzrc5cIqPE3A7jHl/EgKyP41kTQ6BkMU/s0IoINNxkQOo
-uKOh7jSCX07p4Vl6g0QtMHLsSgDK/YSZdjgE13he4CT7U8iwigLHmIpebY80/koKjuM3Tsjs19my
-gTpJhCMisEW4M6zj2hnKbIr336sJdUlFtEwgCGRax8yNOlLlFoTSWzCI9bHgatAMTxzDXElb5GBr
-ZrrdM5ZAjEp7l/bo# */
-/* $$$!!Warning: Deleting or modifying the preceding information is prohibited.$$$ */
-/*
-* Copyright @ Huawei Technologies Co., Ltd. 2019-2029. All rights reserved.
-* Description: Inline_ECC.cpp
-* Author: l00434636
-* Create: 2020-10-27
-*/
-
 #include <stdio.h>
 #include "Inline_ECC.h"
 #include "MemoryController.h"
@@ -172,6 +158,33 @@ uint32_t Inline_ECC::hit_ecc_buf(uint64_t pdu_address) {
         }
     }
     return (wr_buf_hit*2 + rd_buf_hit);
+}
+
+PduProbeResult Inline_ECC::probe_pdu(const Transaction &trans) const {
+    Transaction mapped(trans);
+    addr_exp(&mapped);
+    unsigned val = JEDEC_DATA_BUS_BITS == 32 ? 7 : 8;
+    PduProbeResult result{};
+    result.pdu_addr = mapped.col >> (val + unsigned(IECC_BL32_MODE));
+    result.pdu_addr |= uint64_t(mapped.row) << PDU_ROW;
+    result.pdu_addr |= uint64_t(mapped.group) << PDU_BG;
+    result.pdu_addr |= uint64_t(mapped.bank) << PDU_BA;
+    result.pdu_addr |= uint64_t(mapped.rank) << PDU_RA;
+    result.rd_buf_id = 0xffff;
+    result.wr_buf_id = 0xffff;
+    for (size_t index = 0; index < PDU_RD_DEPTH; ++index) {
+        if (rd_ecc_buf.at(index).vld && rd_ecc_buf.at(index).pdu_addr == result.pdu_addr) {
+            result.hit_result |= 1;
+            result.rd_buf_id = index;
+        }
+    }
+    for (size_t index = 0; index < PDU_WR_DEPTH; ++index) {
+        if (wr_ecc_buf.at(index).vld && wr_ecc_buf.at(index).pdu_addr == result.pdu_addr) {
+            result.hit_result |= 2;
+            result.wr_buf_id = index;
+        }
+    }
+    return result;
 }
 //=================================================================================
 // get ecc buf id
@@ -424,7 +437,8 @@ void Inline_ECC::get_pdu_addr(ECC_BUF_Entry *buf, Transaction *trans) {
     trans->bank = (buf->pdu_addr >> PDU_BA) & ((1ull << (PDU_RA - PDU_BA)) - 1ull);
     trans->rank = buf->pdu_addr >> PDU_RA;
 //    trans->col = 0;
-    trans->col = (buf->pdu_addr & ((1ull << (PDU_ROW)) - 1ull)) << (7ull + unsigned(IECC_BL32_MODE));
+    uint64_t val = JEDEC_DATA_BUS_BITS==32 ? 7ull : 8ull; //x32 2^7col*4B=512B x16 2^8col*2B=512B (8:1)
+    trans->col = (buf->pdu_addr & ((1ull << (PDU_ROW)) - 1ull)) << (val + unsigned(IECC_BL32_MODE));
     trans->bankIndex = trans->rank * NUM_BANKS + trans->group * (NUM_BANKS / NUM_GROUPS) + trans->bank;
     trans->address = buf->pdu_addr;
 }
@@ -445,13 +459,13 @@ bool Inline_ECC::try_add_ecc_rd(Transaction * trans, uint32_t rd_ecc_buf_id) {
     trans_rd_ecc->task = ecc_task;
     trans_rd_ecc->inject_time = now();
     top->parentMemorySystem->trans_init(trans_rd_ecc, now());
-    if (IECC_PRI_FOLLOW) {
-        trans_rd_ecc->qos = trans->qos;
-        trans_rd_ecc->pri = trans->pri;
-    } else {
+    // if (IECC_PRI_FOLLOW) {
+    //     trans_rd_ecc->qos = trans->qos;
+    //     trans_rd_ecc->pri = trans->pri;
+    // } else {
         trans_rd_ecc->qos = IECC_PRI;
         trans_rd_ecc->pri = IECC_PRI;
-    }
+    // }
 //    trans_rd_ecc->qos = IECC_PRI;
 //    trans_rd_ecc->pri = IECC_PRI;
 //    trans_rd_ecc->qos = trans->qos;
@@ -507,8 +521,8 @@ bool Inline_ECC::try_add_ecc_wr(Transaction * trans, uint32_t wr_ecc_buf_id) {
         trans_wr_ecc->qos = trans->qos;
         trans_wr_ecc->pri = trans->pri;
     } else {
-    trans_wr_ecc->qos = IECC_PRI;
-    trans_wr_ecc->pri = IECC_PRI;
+        trans_wr_ecc->qos = IECC_PRI;
+        trans_wr_ecc->pri = IECC_PRI;
     }
     // trans_wr_ecc->qos = IECC_PRI;
     // trans_wr_ecc->pri = IECC_PRI;
@@ -528,6 +542,9 @@ bool Inline_ECC::try_add_ecc_wr(Transaction * trans, uint32_t wr_ecc_buf_id) {
     }
     ret = top->push_after_iecc(trans_wr_ecc);
     if (ret) {
+        if (PDU_PUSH_MODE && trans->transactionType == DATA_WRITE && !trans->mask_wcmd) {
+            wr_ecc_buf.at(wr_ecc_buf_id).ecc_dirty = false;
+        }
         top->tasks_info[trans_wr_ecc->task].rd_finish = false;
         top->tasks_info[trans_wr_ecc->task].wr_finish = false;
         top->tasks_info[trans_wr_ecc->task].wr_ecc = true;
@@ -539,6 +556,18 @@ bool Inline_ECC::try_add_ecc_wr(Transaction * trans, uint32_t wr_ecc_buf_id) {
         ecc_task++;
         ecc_conflict_cnt = IECC_CONFLICT_CNT;
         ecc_merge_flag = false;
+        for (uint32_t index=0; index<PDU_RD_DEPTH; index++) {
+            if (rd_ecc_buf.at(index).vld
+                    && rd_ecc_buf.at(index).pdu_addr == wr_ecc_buf.at(wr_ecc_buf_id).pdu_addr) {
+                rd_ecc_buf.at(index).vld = false;
+                if (DEBUG_BUS) {
+                    PRINTN(setw(10)<<now()<<" -- RD_ECC_INVALIDATE :: task="<<dec<<trans->task
+                            <<", ecc_wr_task="<<trans_wr_ecc->task
+                            <<", pdu_address=0x"<<hex<<wr_ecc_buf.at(wr_ecc_buf_id).pdu_addr
+                            <<dec<<", rd_ecc_buf_id="<<index<<endl);
+                }
+            }
+        }
         if (DEBUG_BUS) {
             PRINTN(setw(10)<<now()<<" -- IECC SCH :: ECC_WRITE_CMD task="<<trans_wr_ecc->task<<" wr_ecc_buf_id="<<wr_ecc_buf_id<<" type="<<trans_wr_ecc->transactionType<<" mask_write="<<trans_wr_ecc->mask_wcmd<<" ecc_flag="<<trans_wr_ecc->ecc_flag 
                     <<" qos="<<trans_wr_ecc->qos<<" burst_length="<<trans_wr_ecc->burst_length<<" channel="<<trans_wr_ecc->channel<<" data_ready_cnt="<<trans_wr_ecc->data_ready_cnt<<" address="<<hex<<trans_wr_ecc->address
@@ -559,17 +588,22 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
     update_rd_ecc_buf();
     update_wr_ecc_buf();
 
+    for (unsigned stage = 0; stage < 3; ++stage) {
     switch (ecc_model_state) {
         case TRY_HIT_ECC_BUF: {
             uint32_t hit_result;
+            uint64_t val = JEDEC_DATA_BUS_BITS==32 ? 7ull : 8ull; //x32 2^7col*4B=512B x16 2^8col*2B=512B (8:1)
             // pdu_addr: [2:0]->col, [20:3]->row, [22:21]->bg, [25:23]->ba, [26]->rank
             // Redundant bits are added to increase the signal bit width.
-            pdu_addr = trans->col >> (7ull + unsigned(IECC_BL32_MODE));
+            pdu_addr = trans->col >> (val + unsigned(IECC_BL32_MODE));
             pdu_addr |= uint64_t(trans->row) << PDU_ROW;
             pdu_addr |= uint64_t(trans->group) << PDU_BG;
             pdu_addr |= uint64_t(trans->bank) << PDU_BA;
             pdu_addr |= uint64_t(trans->rank) << PDU_RA;
             hit_result = hit_ecc_buf(pdu_addr);
+            bool wr_pdu_dirty = (hit_result & 2) != 0
+                    && avail_wr_ecc_buf_id < PDU_WR_DEPTH
+                    && wr_ecc_buf.at(avail_wr_ecc_buf_id).ecc_dirty;
             if (trans->transactionType == DATA_READ) {
                 pdu_read_query_count++;
                 if ((hit_result & 1) != 0) {
@@ -593,25 +627,27 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
                     <<", wr_buf_id="<<avail_wr_ecc_buf_id<<", rd_owner_task="<<rd_owner_task
                     <<", wr_owner_task="<<wr_owner_task<<endl);
             }
-            if ((hit_result == 0) && (trans->transactionType == DATA_READ)) {
+            if (((hit_result == 0) || (hit_result == 2 && !wr_pdu_dirty))
+                    && (trans->transactionType == DATA_READ)) {
                 ecc_model_state = GET_ECC_BUF;
                 if (DEBUG_BUS) {
                     PRINTN(setw(10)<<now()<<" -- TRY_HIT_ECC_BUF :: address=0x"<<hex<<trans->address
                             <<", task="<<dec<<trans->task<<", nxt_state=GET_ECC_BUF"<<endl);
                 }
-            } else if ((hit_result == 1) && (trans->transactionType == DATA_READ)) {
+            } else if (((hit_result == 1) || (hit_result == 3 && !wr_pdu_dirty))
+                    && (trans->transactionType == DATA_READ)) {
                 ecc_model_state = ECC_ADD_TRANS;
                 if (DEBUG_BUS) {
                     PRINTN(setw(10)<<now()<<" -- TRY_HIT_ECC_BUF :: address=0x"<<hex<<trans->address
                             <<", task="<<dec<<trans->task<<", nxt_state=ECC_ADD_TRANS"<<endl);
                 }
-            } else if ((hit_result == 2) && (trans->transactionType == DATA_READ)) {
+            } else if ((hit_result == 2) && wr_pdu_dirty && (trans->transactionType == DATA_READ)) {
                 ecc_model_state = ECC_RD_MISS_DIRTY;// new state ecc write back and data read back
                 if (DEBUG_BUS) {
                     PRINTN(setw(10)<<now()<<" -- TRY_HIT_ECC_BUF :: address=0x"<<hex<<trans->address
                             <<", task="<<dec<<trans->task<<", nxt_state=ECC_RD_MISS_DIRTY"<<endl);
                 }
-            } else if ((hit_result == 3) && (trans->transactionType == DATA_READ)) {
+            } else if ((hit_result == 3) && wr_pdu_dirty && (trans->transactionType == DATA_READ)) {
                 ecc_model_state = ECC_RD_HIT_DIRTY;// new state ecc write back and data read back
                 if (DEBUG_BUS) {
                     PRINTN(setw(10)<<now()<<" -- TRY_HIT_ECC_BUF :: address=0x"<<hex<<trans->address
@@ -632,7 +668,7 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
             } else {
                 assert(0 && "IECC Access Error !");
             }
-            break;
+            continue;
         }
         case GET_ECC_BUF: {
             update_rd_ecc_buf();
@@ -742,7 +778,7 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
                 }
             }
 
-            break;
+            continue;
         }
         case ECC_ADD_TRANS: {
             Transaction *trans_cmd = new Transaction(trans);
@@ -980,6 +1016,8 @@ bool Inline_ECC::proc_iecc(Transaction * trans, uint64_t inject_time) {
             assert(ret && "No Such State");
             return false;
     }
+    break;
+    }
     return false;
 }
 
@@ -1067,7 +1105,7 @@ void Inline_ECC::update() {
 }
 
 // normal command and ecc command use the same column
-void Inline_ECC::addr_exp(Transaction * trans) {
+void Inline_ECC::addr_exp(Transaction * trans) const {
     if (WCMD_MERGE_EN && trans->is_addr_expanded) {
         return;
     }
