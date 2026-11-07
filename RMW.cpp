@@ -258,7 +258,7 @@ bool Rmw::handle_write_merge_transaction(Transaction *trans) {
     for (size_t i = 0; i < RmwQue.size(); i++) {
         Transaction *first = RmwQue[i];
         if (!can_merge_write_pair(first, trans)
-                || is_unpaired_write_merge_timeout(first, RmwCmdState[i])) continue;
+                || is_unpaired_write_merge_timeout(first, RmwCmdState[i], trans)) continue;
         unsigned first_beats = first->burst_length + 1;
         unsigned second_ready = 0;
         auto pending = pending_write_data_cnt.find(trans->task);
@@ -278,6 +278,7 @@ bool Rmw::handle_write_merge_transaction(Transaction *trans) {
             write_merge_data_remaps.push_back(WriteMergeDataRemap(first_task, second_task,
                     first_beats - first->data_ready_cnt));
         }
+        advance_merge_to_cmd_counts(trans, static_cast<unsigned>(i));
         write_merge_first_resp_task[second_task] = first_task;
         merge_candidate_cmds++;
         merge_pairs++;
@@ -293,12 +294,14 @@ bool Rmw::handle_write_merge_transaction(Transaction *trans) {
         RmwQue[i] = trans;
         RmwCmdState[i]->task = second_task;
         RmwCmdState[i]->rmwTimeAdded = now();
+        RmwCmdState[i]->merge_to_cmd_count = 0;
         RmwCmdState[i]->rmwState = QUE_WAITING;
         rebuild_conflict_state();
         return true;
     }
     bool rmw_que_full = full();
     if (rmw_que_full) return false;
+    advance_merge_to_cmd_counts(trans);
     merge_candidate_cmds++;
     auto pending = pending_write_data_cnt.find(trans->task);
     if (pending != pending_write_data_cnt.end()) {
@@ -398,9 +401,27 @@ bool Rmw::has_queued_write_data(uint64_t task) const {
     return std::find(WdataToSend.begin(), WdataToSend.end(), task) != WdataToSend.end();
 }
 
-bool Rmw::is_unpaired_write_merge_timeout(Transaction *trans, cmd_state *state) {
-    return is_write_merge_candidate(trans) && WRITE_MERGE_TIMEOUT != 0
+bool Rmw::counts_toward_merge_to_timeout(const Transaction *trans) const {
+    return trans && (((merge_to_type == 1 || merge_to_type == 2) && trans->transactionType == DATA_WRITE)
+            || (merge_to_type == 2 && trans->transactionType == DATA_READ));
+}
+
+void Rmw::advance_merge_to_cmd_counts(const Transaction *trans, unsigned skip_index) {
+    if (!merge_to_cmd_en || !counts_toward_merge_to_timeout(trans)) return;
+    for (unsigned i = 0; i < RmwCmdState.size(); ++i) {
+        if (i != skip_index && is_write_merge_candidate(RmwQue[i])) {
+            ++RmwCmdState[i]->merge_to_cmd_count;
+        }
+    }
+}
+
+bool Rmw::is_unpaired_write_merge_timeout(Transaction *trans, cmd_state *state, const Transaction *next) {
+    if (!is_write_merge_candidate(trans)) return false;
+    bool time_timeout = WRITE_MERGE_TIMEOUT != 0
             && now() - state->rmwTimeAdded >= WRITE_MERGE_TIMEOUT;
+    unsigned cmd_count = state->merge_to_cmd_count;
+    if (merge_to_cmd_en && counts_toward_merge_to_timeout(next)) ++cmd_count;
+    return time_timeout || (merge_to_cmd_en && cmd_count > merge_to_cmd_prd);
 }
 
 bool Rmw::addData(uint32_t *data, uint64_t task) {
@@ -545,6 +566,7 @@ bool Rmw::addTransaction(Transaction * trans) {
     }
 
 
+    advance_merge_to_cmd_counts(trans);
     pre_req_time = now();
     cmd_state *c = new cmd_state;
     c->task = trans->task;
