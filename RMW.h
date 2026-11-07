@@ -132,6 +132,7 @@ class Rmw:public SimulatorObject {
     
     uint64_t start_cycle;
     uint64_t end_cycle;
+    uint64_t force_bank_sequence;
 
     private:
 //    std::vector<Transaction *> RmwQue;
@@ -184,8 +185,13 @@ class Rmw:public SimulatorObject {
     void rebuild_conflict_state();
     bool is_unpaired_write_merge_timeout(Transaction *trans, cmd_state *state);
     unsigned transaction_slots(const Transaction *trans) const;
-    unsigned rmw_slot_cnt() const;
+    unsigned rmw_slot_cnt() const { return rmw_cmd_cnt + wdata_order_queue.size(); }
     bool has_rmw_slots(unsigned slots) const;
+    bool is_arb_eligible(unsigned index, bool iecc_owned);
+    unsigned select_arb_candidate(const std::vector<unsigned> &eligible);
+    void force_bank_interleave(Transaction *trans);
+    bool push_after_rmw(Transaction *trans);
+    unsigned pdu_locality_streak;
 
 //    public:
 //    unsigned push_cnt;
