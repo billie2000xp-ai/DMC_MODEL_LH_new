@@ -60,7 +60,6 @@ Rmw::Rmw(MemoryController *_top, unsigned id, ostream &DDRSim_log_) :
     merge_pairs = 0;
     merge_unpaired_flushes = 0;
     merge_remap_beats = 0;
-    pdu_locality_streak = 0;
 //    pre_reads = 0; 
 //    pre_bypass_reads = 0; 
 //    pre_bypass_writes = 0; 
@@ -74,7 +73,6 @@ Rmw::Rmw(MemoryController *_top, unsigned id, ostream &DDRSim_log_) :
     RmwInitOutputFiles();
 
     }
-
 
 //void WriteBuff::rcmd_push_wcmd(Transaction * t) {
 //    for (auto &w : Wbuff) {
@@ -227,7 +225,10 @@ bool Rmw::address_conf(Transaction *t, Transaction *cmd) {
 
 bool Rmw::is_write_merge_candidate(const Transaction *trans) const {
     if (trans == NULL || !WCMD_MERGE_EN || trans->transactionType != DATA_WRITE) return false;
-    if ((!BYPASS_MERGEFLAG && !trans->mergeflag) || trans->mask_wcmd || trans->ecc_flag) return false;
+    if (trans->mask_wcmd || trans->ecc_flag) return false;
+    if (!BYPASS_MERGEFLAG) {
+        if (!trans->mergeflag) return false;
+    }
     return ((trans->burst_length + 1) * DMC_DATA_BUS_BITS / 8) == 128;
 }
 
@@ -236,20 +237,6 @@ bool Rmw::can_merge_write_pair(const Transaction *first, const Transaction *seco
     uint64_t low_addr = std::min(first->address, second->address);
     uint64_t high_addr = std::max(first->address, second->address);
     return first->channel == second->channel && ((low_addr ^ high_addr) == 128) && ((low_addr & 127) == 0);
-}
-
-unsigned Rmw::transaction_slots(const Transaction *trans) const {
-    return std::max(1u, (trans->data_size + 127) / 128);
-}
-
-unsigned Rmw::rmw_slot_cnt() const {
-    unsigned slots = 0;
-    for (const auto trans : RmwQue) slots += transaction_slots(trans);
-    return slots;
-}
-
-bool Rmw::has_rmw_slots(unsigned slots) const {
-    return RMW_QUE_DEPTH == 0 || rmw_slot_cnt() + slots <= RMW_QUE_DEPTH;
 }
 
 Transaction *Rmw::build_merged_write_transaction(Transaction *first, Transaction *second, uint64_t merged_task, bool mask_wcmd) {
@@ -270,9 +257,8 @@ bool Rmw::handle_write_merge_transaction(Transaction *trans) {
     merge_candidates++;
     for (size_t i = 0; i < RmwQue.size(); i++) {
         Transaction *first = RmwQue[i];
-        if (!can_merge_write_pair(first, trans)) continue;
-        unsigned merged_slots = transaction_slots(first) + transaction_slots(trans);
-        if (!has_rmw_slots(merged_slots - transaction_slots(first))) return false;
+        if (!can_merge_write_pair(first, trans)
+                || is_unpaired_write_merge_timeout(first, RmwCmdState[i])) continue;
         unsigned first_beats = first->burst_length + 1;
         unsigned second_ready = 0;
         auto pending = pending_write_data_cnt.find(trans->task);
@@ -311,7 +297,8 @@ bool Rmw::handle_write_merge_transaction(Transaction *trans) {
         rebuild_conflict_state();
         return true;
     }
-    if (!has_rmw_slots(transaction_slots(trans))) return false;
+    bool rmw_que_full = full();
+    if (rmw_que_full) return false;
     merge_candidate_cmds++;
     auto pending = pending_write_data_cnt.find(trans->task);
     if (pending != pending_write_data_cnt.end()) {
@@ -416,50 +403,6 @@ bool Rmw::is_unpaired_write_merge_timeout(Transaction *trans, cmd_state *state) 
             && now() - state->rmwTimeAdded >= WRITE_MERGE_TIMEOUT;
 }
 
-bool Rmw::is_arb_eligible(unsigned index, bool iecc_owned) {
-    if (now() < RmwQue[index]->arb_time) return false;
-    if (top->iecc->iecc_owner_valid && !iecc_owned) return false;
-    if (RmwConfCnt[index]->ad_conf_cnt != 0 && !iecc_owned) return false;
-    if (RmwCmdState[index]->rmwState == MERGE_READ && RmwQue[index]->mask_wcmd) return false;
-    bool merged_command = write_merge_first_resp_task.find(RmwQue[index]->task)
-            != write_merge_first_resp_task.end();
-    if (is_write_merge_candidate(RmwQue[index]) && !merged_command
-            && !is_unpaired_write_merge_timeout(RmwQue[index], RmwCmdState[index])) return false;
-    if (RmwQue[index]->transactionType == DATA_WRITE && !RmwQue[index]->mask_wcmd
-            && RMW_CMD_MODE == 1 && RmwCmdState[index]->rmwState != SEND_READY) return false;
-    if (RmwQue[index]->transactionType == DATA_WRITE && !RmwQue[index]->mask_wcmd
-            && RmwQue[index]->ecc_flag && RmwCmdState[index]->rmwState != SEND_READY) return false;
-    return true;
-}
-
-unsigned Rmw::select_arb_candidate(const std::vector<unsigned> &eligible) {
-    unsigned first = eligible.front();
-    if (!IECC_ENABLE || IECC_PDU_SCHED_MODE == 0 || top->iecc->iecc_owner_valid) {
-        pdu_locality_streak = 0;
-        return first;
-    }
-    if ((PDU_REORDER_MAX_AGE != 0
-            && now() - RmwCmdState[first]->rmwTimeAdded >= PDU_REORDER_MAX_AGE)
-            || (PDU_LOCALITY_BUDGET != 0 && pdu_locality_streak >= PDU_LOCALITY_BUDGET)) {
-        pdu_locality_streak = 0;
-        return first;
-    }
-    if (RmwQue[first]->transactionType == DATA_WRITE
-            && (top->iecc->probe_pdu(*RmwQue[first]).hit_result & 2) != 0) {
-        pdu_locality_streak = 0;
-        return first;
-    }
-    for (auto index : eligible) {
-        if (RmwQue[index]->qos != RmwQue[first]->qos) continue;
-        if (RmwQue[index]->transactionType != DATA_WRITE) continue;
-        if ((top->iecc->probe_pdu(*RmwQue[index]).hit_result & 2) == 0) continue;
-        pdu_locality_streak++;
-        return index;
-    }
-    pdu_locality_streak = 0;
-    return first;
-}
-
 bool Rmw::addData(uint32_t *data, uint64_t task) {
     if (remap_write_merge_data(data, task)) return true;
     auto fast_bypass = fast_bypass_write_data_cnt.find(task);
@@ -490,6 +433,9 @@ bool Rmw::addData(uint32_t *data, uint64_t task) {
     }
 
     if (task_match==false) {
+        if (DEBUG_BUS) {
+             PRINTN(setw(10)<<now()<<" -- RMW_WDATA_BYPASS :: task="<<task<<endl);
+        }
 //        bool ret = false;
 //        if (EM_ENABLE) {
 //            ret = top->channels[0]->addData(data ,task);
@@ -556,7 +502,7 @@ bool Rmw::addTransaction(Transaction * trans) {
 
 
 //    uint8_t ch = trans->channel;
-    bool rmw_que_full  = !has_rmw_slots(transaction_slots(trans));
+    bool rmw_que_full = full();
     bool rmw_que_empty = rmw_cmd_cnt == 0;
 
     if (is_write_merge_candidate(trans)) {
@@ -854,7 +800,6 @@ void Rmw::arb_node() {
     }
 
     unsigned size = RmwQue.size();
-    std::vector<unsigned> eligible;
     for (unsigned i = 0; i < size; i++) {
         if ((RmwQue[i]->transactionType == DATA_READ) && (RmwCmdState[i]->rmwState!=QUE_WAITING)){
             ERROR(setw(10)<<now()<<" -- Read Cmd State Wrong, task="<<RmwQue[i]->task<<" type="<<RmwQue[i]->transactionType<<" channel="<<RmwQue[i]->channel
@@ -862,21 +807,6 @@ void Rmw::arb_node() {
                    <<" rmw_mode="<<RMW_CMD_MODE);
             assert(0);
         }
-
-        bool iecc_owned = top->iecc->iecc_owner_valid
-                && RmwQue[i]->task == top->iecc->iecc_owner_task;
-        if (is_arb_eligible(i, iecc_owned)) eligible.push_back(i);
-    }
-    if (eligible.empty()) return;
-
-    unsigned selected = select_arb_candidate(eligible);
-    std::vector<unsigned> arb_order;
-    arb_order.push_back(selected);
-    for (auto index : eligible) {
-        if (index != selected) arb_order.push_back(index);
-    }
-
-    for (auto i : arb_order) {
 
         if (now() < RmwQue[i]->arb_time) { 
             continue;
@@ -894,7 +824,7 @@ void Rmw::arb_node() {
         }
         bool merged_command = write_merge_first_resp_task.find(RmwQue[i]->task)
                 != write_merge_first_resp_task.end();
-        if (is_write_merge_candidate(RmwQue[i]) && !merged_command
+        if (is_write_merge_candidate(RmwQue[i])
                 && !is_unpaired_write_merge_timeout(RmwQue[i], RmwCmdState[i])) {
             continue;
         }
@@ -1033,6 +963,9 @@ void Rmw::arb_node() {
 
 void Rmw::send_wdata() {
     if (!WdataToSend.empty() && !WdataChannel.empty()) {
+        if (DEBUG_BUS) {
+            PRINTN(setw(10)<<now()<<" -- RMW_SEND_WDATA :: task="<<WdataToSend[0]<<" channel="<<WdataChannel[0]<<endl);
+        }
         uint64_t task = WdataToSend[0];
         bool submit_ret = top->parentMemorySystem->submitData(NULL, task, false);
         if (submit_ret) {
@@ -1045,7 +978,7 @@ void Rmw::send_wdata() {
 
 
 unsigned Rmw:: GetRmwQsize() {
-    return (rmw_cmd_cnt);
+    return rmw_slot_cnt();
 }
 
 void Rmw::check_cnt() {
